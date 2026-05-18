@@ -54,6 +54,9 @@ final class Dictator {
     // start/stop and after each session finalize to refresh counts.
     var statusItem: StatusItemController?
 
+    // In-your-eyeline floating overlay shown while Option is held.
+    var overlay: RecordingOverlay?
+
     init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex) {
         self.store = store
         self.workflows = workflows
@@ -104,11 +107,13 @@ final class Dictator {
                 self.isOptionDown = true
                 NSLog("SonarDictate: Option DOWN — startListening")
                 self.statusItem?.setListening(true)
+                self.overlay?.show()
                 self.startListening()
             } else if !nowDown && self.isOptionDown {
                 self.isOptionDown = false
                 NSLog("SonarDictate: Option UP — stopListening")
                 self.statusItem?.setListening(false)
+                self.overlay?.hide()
                 self.stopListening()
             }
         }
@@ -176,11 +181,16 @@ final class Dictator {
     // buffering for trigger detection), streams stable text into the
     // focused app, and on isFinal=true triggers finalize().
     private func handleTranscript(_ current: String, isFinal: Bool) {
+        // Update the floating overlay so the user can see what's being
+        // transcribed in real time, regardless of mode.
+        overlay?.updateTranscript(current)
+
         if isFinal {
             if sessionMode == .initial {
                 let decided = decideMode(from: current)
                 sessionMode = decided == .initial ? .streaming : decided
                 NSLog("SonarDictate: session mode -> \(sessionMode.rawValue) (on isFinal)")
+                overlay?.setBufferingMode(sessionMode == .buffering)
             }
             if sessionMode == .streaming {
                 streamEmit(target: current, isFinal: true)
@@ -192,6 +202,7 @@ final class Dictator {
                 if decided != .initial {
                     sessionMode = decided
                     NSLog("SonarDictate: session mode -> \(decided.rawValue) (on partial: \(current.prefix(40)))")
+                    overlay?.setBufferingMode(decided == .buffering)
                 }
             }
             guard sessionMode == .streaming else { return }
@@ -612,7 +623,9 @@ do {
 if #available(macOS 26.0, *) {
     let dictator = Dictator(store: store, workflows: workflows, rag: rag)
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
+    let overlay = RecordingOverlay()
     dictator.statusItem = statusItem
+    dictator.overlay = overlay
     dictator.bootstrap()
     NSApplication.shared.run()
 } else {
