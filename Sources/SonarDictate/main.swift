@@ -29,14 +29,16 @@ final class Dictator {
 
     // Persistence
     private let store: SecureStore
+    private let workflows: WorkflowStore
     private var audioFrames: [AVAudioPCMBuffer] = []
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
     private var finalPersisted = false  // guard so we persist once per session
 
-    init(store: SecureStore) {
+    init(store: SecureStore, workflows: WorkflowStore) {
         self.store = store
+        self.workflows = workflows
     }
 
     func bootstrap() {
@@ -152,9 +154,29 @@ final class Dictator {
         let format = sessionFormat
         audioFrames.removeAll()
 
-        // Classify trigger
-        let action = TriggerRouter.classify(transcript)
+        // Classify trigger (user-defined workflow bindings win over built-in triggers).
+        let action = TriggerRouter.classify(transcript, workflowStore: workflows)
         NSLog("SonarDictate: classified -> \(action)")
+
+        // If this was a user-defined workflow trigger, fire the workflow via
+        // /usr/bin/automator. The streaming inject already typed the trigger
+        // phrase into the focused app — backspace it now so the user doesn't
+        // see "rotate cert" sitting in their editor after the workflow runs.
+        if case let .runWorkflow(binding, input) = action {
+            let toBackspace = emittedText.count
+            emittedText = ""
+            if toBackspace > 0 { backspace(count: toBackspace) }
+
+            let store = self.workflows
+            Task.detached(priority: .userInitiated) {
+                do {
+                    let code = try store.execute(binding, input: input.isEmpty ? nil : input)
+                    NSLog("SonarDictate: workflow '\(binding.name)' exited \(code)")
+                } catch {
+                    NSLog("SonarDictate: workflow '\(binding.name)' failed: \(error)")
+                }
+            }
+        }
 
         // Persist asynchronously so we don't block the recognition callback
         DispatchQueue.global(qos: .utility).async { [store] in
@@ -281,8 +303,10 @@ final class Dictator {
 
 func runCLI(_ args: [String]) -> Never {
     let store: SecureStore
+    let workflows: WorkflowStore
     do {
         store = try SecureStore()
+        workflows = try WorkflowStore()
     } catch {
         fputs("error: \(error)\n", stderr)
         exit(1)
@@ -325,12 +349,78 @@ func runCLI(_ args: [String]) -> Never {
         case "reset":
             try store.reset()
             print("reset complete. all recordings and the device key are gone.")
+
+        // Workflow / Automator binding commands
+
+        case "workflows":
+            let bindings = try workflows.list()
+            if bindings.isEmpty {
+                print("(no workflows bound)")
+                print("\nbind one with: sonar-dictate bind \"<trigger phrase>\" <path-to-.workflow> [name]")
+            } else {
+                let df = ISO8601DateFormatter()
+                for b in bindings {
+                    print("\(b.id)  \"\(b.triggerPhrase)\"  →  \(b.name)")
+                    print("        path: \(b.workflowPath)")
+                    print("        bound: \(df.string(from: b.registeredAt))")
+                }
+                print("\n(\(bindings.count) total)")
+            }
+        case "bind":
+            guard rest.count >= 2 else {
+                fputs("usage: sonar-dictate bind \"<trigger phrase>\" <path-to-.workflow> [friendly-name]\n", stderr)
+                exit(2)
+            }
+            let phrase = rest[0]
+            let path = rest[1]
+            let name = rest.count > 2 ? rest[2] : nil
+            let b = try workflows.register(triggerPhrase: phrase, workflowPath: path, name: name)
+            print("bound \(b.id): \"\(b.triggerPhrase)\" → \(b.name)")
+            print("  path: \(b.workflowPath)")
+        case "unbind":
+            guard let idOrPhrase = rest.first else {
+                fputs("usage: sonar-dictate unbind <id-or-phrase>\n", stderr)
+                exit(2)
+            }
+            try workflows.unregister(id: idOrPhrase)
+            print("unbound \(idOrPhrase)")
+        case "runwf":
+            guard let idOrPhrase = rest.first else {
+                fputs("usage: sonar-dictate runwf <id-or-phrase> [input-text...]\n", stderr)
+                exit(2)
+            }
+            let input = rest.dropFirst().joined(separator: " ")
+            let bindings = try workflows.list()
+            let binding = bindings.first(where: { $0.id == idOrPhrase || $0.triggerPhrase == idOrPhrase.lowercased() })
+            guard let binding = binding else {
+                fputs("error: no binding matches '\(idOrPhrase)'\n", stderr)
+                exit(1)
+            }
+            print("running '\(binding.name)' (\(binding.workflowPath))…")
+            let code = try workflows.execute(binding, input: input.isEmpty ? nil : input)
+            print("exit \(code)")
+
         case "help", "-h", "--help":
-            print("usage:  sonar-dictate [list|read <id>|delete <id>|reset]")
-            print("        (no args)  launch background dictation app")
+            print("""
+            usage:  sonar-dictate <command> [args...]
+
+            recordings:
+              list                          list all encrypted recordings
+              read <id>                     print transcript for a recording
+              delete <id>                   delete one recording
+              reset                         wipe storage + Secure Enclave key
+
+            workflows (Automator bindings):
+              workflows                     list bound workflows
+              bind "<phrase>" <path> [name] bind a trigger phrase to a .workflow bundle
+              unbind <id-or-phrase>         remove a binding
+              runwf <id-or-phrase> [input]  fire a workflow manually (for testing)
+
+            (no args)  launch background dictation app
+            """)
         default:
             fputs("unknown command: \(cmd)\n", stderr)
-            fputs("usage:  sonar-dictate [list|read <id>|delete <id>|reset]\n", stderr)
+            fputs("try: sonar-dictate help\n", stderr)
             exit(2)
         }
     } catch {
@@ -349,13 +439,15 @@ if !cliArgs.isEmpty {
 
 // No args → background dictation mode.
 let store: SecureStore
+let workflows: WorkflowStore
 do {
     store = try SecureStore()
+    workflows = try WorkflowStore()
 } catch {
-    NSLog("SonarDictate: failed to init SecureStore: \(error)")
+    NSLog("SonarDictate: failed to init stores: \(error)")
     exit(1)
 }
 
-let dictator = Dictator(store: store)
+let dictator = Dictator(store: store, workflows: workflows)
 dictator.bootstrap()
 NSApplication.shared.run()
