@@ -30,15 +30,17 @@ final class Dictator {
     // Persistence
     private let store: SecureStore
     private let workflows: WorkflowStore
+    private let rag: RAGIndex
     private var audioFrames: [AVAudioPCMBuffer] = []
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
     private var finalPersisted = false  // guard so we persist once per session
 
-    init(store: SecureStore, workflows: WorkflowStore) {
+    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex) {
         self.store = store
         self.workflows = workflows
+        self.rag = rag
     }
 
     func bootstrap() {
@@ -95,6 +97,21 @@ final class Dictator {
         sessionStart = Date()
         finalPersisted = false
         sessionAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+
+        // Seed the recognizer with vocabulary biased toward what this user has
+        // said recently in this app context. Costs ~5ms for a few-hundred-item
+        // index; no-op when the RAG store is empty (first runs).
+        if rag.assetsReady, rag.count > 0 {
+            do {
+                let bias = try rag.vocabularyBias(forContext: sessionAppContext, k: 8)
+                if !bias.isEmpty {
+                    request?.contextualStrings = bias
+                    NSLog("SonarDictate: biased recognizer with \(bias.count) terms from RAG")
+                }
+            } catch {
+                NSLog("SonarDictate: RAG bias skipped: \(error)")
+            }
+        }
 
         let format = engine.inputNode.outputFormat(forBus: 0)
         sessionFormat = format
@@ -179,8 +196,25 @@ final class Dictator {
         }
 
         // Persist asynchronously so we don't block the recognition callback
-        DispatchQueue.global(qos: .utility).async { [store] in
-            guard let format = format, !frames.isEmpty else {
+        DispatchQueue.global(qos: .utility).async { [store, rag] in
+            let createdAt = Date()
+            let persistedID: String?
+            if let format = format, !frames.isEmpty {
+                do {
+                    let audioData = try Dictator.serializeWAV(frames: frames, format: format)
+                    let id = try store.write(
+                        audio: audioData,
+                        transcript: transcript,
+                        appContext: appCtx,
+                        durationSeconds: duration
+                    )
+                    NSLog("SonarDictate: persisted \(id) (\(audioData.count) bytes, \(String(format: "%.1fs", duration)))")
+                    persistedID = id
+                } catch {
+                    NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
+                    persistedID = nil
+                }
+            } else {
                 NSLog("SonarDictate: no audio frames captured; persisting transcript only")
                 do {
                     let id = try store.write(
@@ -190,23 +224,23 @@ final class Dictator {
                         durationSeconds: duration
                     )
                     NSLog("SonarDictate: persisted \(id) (transcript-only)")
+                    persistedID = id
                 } catch {
                     NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
+                    persistedID = nil
                 }
-                return
             }
 
-            do {
-                let audioData = try Dictator.serializeWAV(frames: frames, format: format)
-                let id = try store.write(
-                    audio: audioData,
-                    transcript: transcript,
-                    appContext: appCtx,
-                    durationSeconds: duration
-                )
-                NSLog("SonarDictate: persisted \(id) (\(audioData.count) bytes, \(String(format: "%.1fs", duration)))")
-            } catch {
-                NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
+            // Ingest into RAG index (independent of audio persistence)
+            if let id = persistedID, rag.assetsReady {
+                do {
+                    try rag.add(id: id, transcript: transcript, appContext: appCtx, createdAt: createdAt)
+                    NSLog("SonarDictate: RAG ingested \(id), total entries=\(rag.count)")
+                } catch {
+                    NSLog("SonarDictate: RAG ingest failed: \(error)")
+                }
+            } else if persistedID != nil, !rag.assetsReady {
+                NSLog("SonarDictate: RAG embedding model not ready yet; transcript queued via store and can be re-indexed later")
             }
         }
     }
@@ -304,9 +338,11 @@ final class Dictator {
 func runCLI(_ args: [String]) -> Never {
     let store: SecureStore
     let workflows: WorkflowStore
+    let rag: RAGIndex
     do {
         store = try SecureStore()
         workflows = try WorkflowStore()
+        rag = try RAGIndex()
     } catch {
         fputs("error: \(error)\n", stderr)
         exit(1)
@@ -400,6 +436,36 @@ func runCLI(_ args: [String]) -> Never {
             let code = try workflows.execute(binding, input: input.isEmpty ? nil : input)
             print("exit \(code)")
 
+        // RAG / retrieval commands
+
+        case "rag":
+            print("RAG index entries: \(rag.count)")
+            print("Embedding model assets ready: \(rag.assetsReady)")
+            if !rag.assetsReady {
+                print("(NLContextualEmbedding is still downloading. Re-run after a few minutes.)")
+            }
+        case "similar":
+            guard !rest.isEmpty else {
+                fputs("usage: sonar-dictate similar <text...>\n", stderr)
+                exit(2)
+            }
+            let query = rest.joined(separator: " ")
+            let hits = try rag.query(query, k: 5)
+            if hits.isEmpty {
+                print("(no similar past recordings)")
+            } else {
+                let df = ISO8601DateFormatter()
+                for h in hits {
+                    let ctx = h.entry.appContext ?? "?"
+                    print(String(format: "%.3f  ", h.score)
+                          + "\(h.entry.id)  \(df.string(from: h.entry.createdAt))  \(ctx)")
+                    print("        \"\(h.entry.preview.replacingOccurrences(of: "\n", with: " ").prefix(120))\"")
+                }
+            }
+        case "rag-reset":
+            try rag.reset()
+            print("RAG index cleared. Recordings retained; future dictations will rebuild the index.")
+
         case "help", "-h", "--help":
             print("""
             usage:  sonar-dictate <command> [args...]
@@ -415,6 +481,11 @@ func runCLI(_ args: [String]) -> Never {
               bind "<phrase>" <path> [name] bind a trigger phrase to a .workflow bundle
               unbind <id-or-phrase>         remove a binding
               runwf <id-or-phrase> [input]  fire a workflow manually (for testing)
+
+            RAG (local retrieval):
+              rag                           index stats + embedding model status
+              similar <text...>             top-5 past recordings by cosine similarity
+              rag-reset                     drop the index (recordings stay; reindex next session)
 
             (no args)  launch background dictation app
             """)
@@ -440,14 +511,16 @@ if !cliArgs.isEmpty {
 // No args → background dictation mode.
 let store: SecureStore
 let workflows: WorkflowStore
+let rag: RAGIndex
 do {
     store = try SecureStore()
     workflows = try WorkflowStore()
+    rag = try RAGIndex()
 } catch {
     NSLog("SonarDictate: failed to init stores: \(error)")
     exit(1)
 }
 
-let dictator = Dictator(store: store, workflows: workflows)
+let dictator = Dictator(store: store, workflows: workflows, rag: rag)
 dictator.bootstrap()
 NSApplication.shared.run()
