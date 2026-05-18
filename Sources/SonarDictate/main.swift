@@ -2,25 +2,24 @@ import Foundation
 import AVFoundation
 import Speech
 import AppKit
+import ApplicationServices
 
 // On-device voice-to-text spike.
 //
-// Behavior:
-//   - Press and hold the Option key to talk; release to stop.
-//   - Stable phrases stream into the focused app as you speak.
-//   - On revision, characters are backspaced and corrected.
-//   - 100% on-device: `requiresOnDeviceRecognition = true`.
+// Two modes, decided by CLI args:
+//   - No args:        menu-bar background mode. Hold Option to talk, release
+//                     to stop. Stream stable phrases into the focused app.
+//                     On final transcript: persist audio+transcript to the
+//                     encrypted SecureStore and classify for trigger words.
+//   - With command:   `list | read <id> | delete <id> | reset`. Runs the
+//                     CLI op against the SecureStore and exits.
 //
-// Permissions on first run (System Settings → Privacy & Security):
-//   - Microphone (Terminal or whatever runs this)
-//   - Speech Recognition (Terminal)
-//   - Accessibility (Terminal) — required for global hotkey + keystroke injection
-//
-// macOS 26+: migrate to SpeechAnalyzer + SpeechTranscriber for faster partial
-// cadence and explicit volatile/stable result types. This SFSpeechRecognizer
-// version is the proven-compatible baseline.
+// 100% on-device: requiresOnDeviceRecognition = true. Audio is encrypted
+// under a Secure Enclave-bound key (see SecureStore.swift). No network IO.
 
-class Dictator {
+// MARK: - Dictator
+
+final class Dictator {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -28,15 +27,41 @@ class Dictator {
     private var isOptionDown = false
     private var emittedText = ""
 
+    // Persistence
+    private let store: SecureStore
+    private var audioFrames: [AVAudioPCMBuffer] = []
+    private var sessionStart: Date?
+    private var sessionFormat: AVAudioFormat?
+    private var sessionAppContext: String?
+    private var finalPersisted = false  // guard so we persist once per session
+
+    init(store: SecureStore) {
+        self.store = store
+    }
+
     func bootstrap() {
+        NSLog("SonarDictate: bootstrap()")
+
         guard recognizer.supportsOnDeviceRecognition else {
-            print("On-device recognition not supported on this Mac.")
+            NSLog("SonarDictate: on-device recognition NOT supported on this Mac")
             exit(1)
         }
+
+        // Explicit Accessibility trust check. Without this, addGlobalMonitorForEvents
+        // silently fails AND the app may not appear in the Accessibility list at all.
+        let promptKey = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
+        let opts = [promptKey: true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(opts)
+        NSLog("SonarDictate: Accessibility trusted=\(trusted)")
+        if !trusted {
+            NSLog("SonarDictate: System Settings → Privacy & Security → Accessibility → enable SonarDictate, then restart this app.")
+        }
+
         SFSpeechRecognizer.requestAuthorization { status in
+            NSLog("SonarDictate: Speech auth status raw=\(status.rawValue)")
             guard status == .authorized else {
-                print("Speech permission denied. Grant in System Settings → Privacy & Security → Speech Recognition.")
-                exit(1)
+                NSLog("SonarDictate: Speech permission NOT authorized. Grant in System Settings → Privacy & Security → Speech Recognition.")
+                return
             }
             DispatchQueue.main.async { self.installMonitor() }
         }
@@ -48,13 +73,15 @@ class Dictator {
             let nowDown = event.modifierFlags.contains(.option)
             if nowDown && !self.isOptionDown {
                 self.isOptionDown = true
+                NSLog("SonarDictate: Option DOWN — startListening")
                 self.startListening()
             } else if !nowDown && self.isOptionDown {
                 self.isOptionDown = false
+                NSLog("SonarDictate: Option UP — stopListening")
                 self.stopListening()
             }
         }
-        print("Ready. Focus any app, hold Option to talk, release to stop.")
+        NSLog("SonarDictate: Ready. Focus any app, hold Option to talk, release to stop.")
     }
 
     private func startListening() {
@@ -62,31 +89,46 @@ class Dictator {
         request?.shouldReportPartialResults = true
         request?.requiresOnDeviceRecognition = true  // thesis line — never falls back to cloud
         emittedText = ""
+        audioFrames.removeAll()
+        sessionStart = Date()
+        finalPersisted = false
+        sessionAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
         let format = engine.inputNode.outputFormat(forBus: 0)
+        sessionFormat = format
         engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.request?.append(buffer)
+            if let copy = self?.copy(of: buffer) {
+                self?.audioFrames.append(copy)
+            }
         }
 
         do {
             engine.prepare()
             try engine.start()
-            task = recognizer.recognitionTask(with: request!) { [weak self] result, _ in
-                guard let self, let result = result else { return }
+            task = recognizer.recognitionTask(with: request!) { [weak self] result, error in
+                guard let self else { return }
+                if let error = error {
+                    NSLog("SonarDictate: recognitionTask error: \(error.localizedDescription)")
+                }
+                guard let result = result else { return }
                 let current = result.bestTranscription.formattedString
 
                 if result.isFinal {
-                    DispatchQueue.main.async { self.streamEmit(target: current) }
+                    DispatchQueue.main.async {
+                        self.streamEmit(target: current, isFinal: true)
+                        self.finalize(transcript: current)
+                    }
                 } else {
                     // Hold back the trailing word — most likely to get revised.
                     let words = current.split(separator: " ", omittingEmptySubsequences: false)
                     guard words.count >= 2 else { return }
                     let stable = words.dropLast().joined(separator: " ") + " "
-                    DispatchQueue.main.async { self.streamEmit(target: stable) }
+                    DispatchQueue.main.async { self.streamEmit(target: stable, isFinal: false) }
                 }
             }
         } catch {
-            print("Audio start failed: \(error)")
+            NSLog("SonarDictate: audio start failed: \(error.localizedDescription)")
         }
     }
 
@@ -94,23 +136,116 @@ class Dictator {
         request?.endAudio()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-        // The isFinal callback flushes the tail; task/request will be GC'd on next startListening().
+        // isFinal callback flushes the tail and triggers finalize().
     }
 
-    private func streamEmit(target: String) {
+    // Called once per session when isFinal=true.
+    // - Persists audio + transcript via SecureStore
+    // - Classifies for trigger words (currently log only; handlers later)
+    private func finalize(transcript: String) {
+        guard !finalPersisted else { return }
+        finalPersisted = true
+
+        let duration = sessionStart.map { -$0.timeIntervalSinceNow } ?? 0
+        let appCtx = sessionAppContext
+        let frames = audioFrames
+        let format = sessionFormat
+        audioFrames.removeAll()
+
+        // Classify trigger
+        let action = TriggerRouter.classify(transcript)
+        NSLog("SonarDictate: classified -> \(action)")
+
+        // Persist asynchronously so we don't block the recognition callback
+        DispatchQueue.global(qos: .utility).async { [store] in
+            guard let format = format, !frames.isEmpty else {
+                NSLog("SonarDictate: no audio frames captured; persisting transcript only")
+                do {
+                    let id = try store.write(
+                        audio: Data(),
+                        transcript: transcript,
+                        appContext: appCtx,
+                        durationSeconds: duration
+                    )
+                    NSLog("SonarDictate: persisted \(id) (transcript-only)")
+                } catch {
+                    NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            do {
+                let audioData = try Dictator.serializeWAV(frames: frames, format: format)
+                let id = try store.write(
+                    audio: audioData,
+                    transcript: transcript,
+                    appContext: appCtx,
+                    durationSeconds: duration
+                )
+                NSLog("SonarDictate: persisted \(id) (\(audioData.count) bytes, \(String(format: "%.1fs", duration)))")
+            } catch {
+                NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // Serialize accumulated PCM buffers to WAV bytes via a temp file.
+    // The temp file is shredded immediately after read.
+    private static func serializeWAV(frames: [AVAudioPCMBuffer], format: AVAudioFormat) throws -> Data {
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("sonar-dictate-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        // Scope the AVAudioFile so it closes before we read the bytes.
+        do {
+            var audioFile: AVAudioFile? = try AVAudioFile(forWriting: tempURL, settings: format.settings)
+            for buf in frames {
+                try audioFile?.write(from: buf)
+            }
+            audioFile = nil  // force close + flush
+        }
+
+        return try Data(contentsOf: tempURL)
+    }
+
+    // PCM buffer copy — the original buffer's storage is reused by the audio
+    // engine, so we must clone the bytes to keep them.
+    private func copy(of buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = buffer.frameLength
+
+        let channelCount = Int(buffer.format.channelCount)
+        if let src = buffer.floatChannelData, let dst = copy.floatChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], Int(buffer.frameLength) * MemoryLayout<Float>.size)
+            }
+        } else if let src = buffer.int16ChannelData, let dst = copy.int16ChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], Int(buffer.frameLength) * MemoryLayout<Int16>.size)
+            }
+        } else if let src = buffer.int32ChannelData, let dst = copy.int32ChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], Int(buffer.frameLength) * MemoryLayout<Int32>.size)
+            }
+        }
+        return copy
+    }
+
+    // MARK: - Streaming injection
+
+    private func streamEmit(target: String, isFinal: Bool) {
         if target.hasPrefix(emittedText) {
-            // Forward extension — inject the new suffix.
             let delta = String(target.dropFirst(emittedText.count))
             if !delta.isEmpty {
                 inject(delta)
                 emittedText = target
             }
         } else if emittedText.hasPrefix(target) {
-            // Revision shrinks the text — backspace to match.
             backspace(count: emittedText.count - target.count)
             emittedText = target
         } else {
-            // Mid-string revision — nuke and reinject.
             backspace(count: emittedText.count)
             inject(target)
             emittedText = target
@@ -142,6 +277,85 @@ class Dictator {
     }
 }
 
-let dictator = Dictator()
+// MARK: - CLI dispatch
+
+func runCLI(_ args: [String]) -> Never {
+    let store: SecureStore
+    do {
+        store = try SecureStore()
+    } catch {
+        fputs("error: \(error)\n", stderr)
+        exit(1)
+    }
+
+    let cmd = args[0]
+    let rest = Array(args.dropFirst())
+
+    do {
+        switch cmd {
+        case "list":
+            let records = try store.list()
+            if records.isEmpty {
+                print("(no recordings)")
+            } else {
+                let df = ISO8601DateFormatter()
+                for r in records {
+                    let ctx = r.appContext ?? "?"
+                    let preview = r.transcriptPreview
+                        .replacingOccurrences(of: "\n", with: " ")
+                        .prefix(80)
+                    print("\(r.id)  \(df.string(from: r.createdAt))  \(String(format: "%6.1fs", r.durationSeconds))  \(ctx)  \"\(preview)\"")
+                }
+                print("\n(\(records.count) total)")
+            }
+        case "read":
+            guard let id = rest.first else {
+                fputs("usage: sonar-dictate read <id>\n", stderr)
+                exit(2)
+            }
+            let (_, transcript) = try store.read(id)
+            print(transcript)
+        case "delete":
+            guard let id = rest.first else {
+                fputs("usage: sonar-dictate delete <id>\n", stderr)
+                exit(2)
+            }
+            try store.delete(id)
+            print("deleted \(id)")
+        case "reset":
+            try store.reset()
+            print("reset complete. all recordings and the device key are gone.")
+        case "help", "-h", "--help":
+            print("usage:  sonar-dictate [list|read <id>|delete <id>|reset]")
+            print("        (no args)  launch background dictation app")
+        default:
+            fputs("unknown command: \(cmd)\n", stderr)
+            fputs("usage:  sonar-dictate [list|read <id>|delete <id>|reset]\n", stderr)
+            exit(2)
+        }
+    } catch {
+        fputs("error: \(error)\n", stderr)
+        exit(1)
+    }
+    exit(0)
+}
+
+// MARK: - Entry point
+
+let cliArgs = Array(CommandLine.arguments.dropFirst())
+if !cliArgs.isEmpty {
+    runCLI(cliArgs)
+}
+
+// No args → background dictation mode.
+let store: SecureStore
+do {
+    store = try SecureStore()
+} catch {
+    NSLog("SonarDictate: failed to init SecureStore: \(error)")
+    exit(1)
+}
+
+let dictator = Dictator(store: store)
 dictator.bootstrap()
 NSApplication.shared.run()
