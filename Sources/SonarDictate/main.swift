@@ -19,6 +19,17 @@ import ApplicationServices
 
 // MARK: - Dictator
 
+// Per-session decision: are we streaming partials into the focused app
+// (regular dictation), or buffering them silently (the first word looks
+// like a trigger and the user shouldn't see "yo create a ticket" typed
+// and then yanked back)? The state stays `.initial` until the first
+// reasonably stable partial arrives, at which point we commit.
+enum SessionMode: String {
+    case initial    // not enough signal yet; don't stream, don't decide
+    case streaming  // committed to dictate mode; partials get injected
+    case buffering  // first word looked trigger-shaped; suppress injection
+}
+
 final class Dictator {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
     private let engine = AVAudioEngine()
@@ -26,6 +37,9 @@ final class Dictator {
     private var task: SFSpeechRecognitionTask?
     private var isOptionDown = false
     private var emittedText = ""
+
+    // Per-session injection mode (see SessionMode above)
+    private var sessionMode: SessionMode = .initial
 
     // Persistence
     private let store: SecureStore
@@ -93,6 +107,7 @@ final class Dictator {
         request?.shouldReportPartialResults = true
         request?.requiresOnDeviceRecognition = true  // thesis line — never falls back to cloud
         emittedText = ""
+        sessionMode = .initial
         audioFrames.removeAll()
         sessionStart = Date()
         finalPersisted = false
@@ -135,11 +150,36 @@ final class Dictator {
 
                 if result.isFinal {
                     DispatchQueue.main.async {
-                        self.streamEmit(target: current, isFinal: true)
+                        // If we never committed a mode (short utterance: only
+                        // 1 word ever, or recognizer never produced a multi-
+                        // word partial before isFinal), decide now from the
+                        // final transcript. Default to streaming if still
+                        // ambiguous so plain dictation still injects.
+                        if self.sessionMode == .initial {
+                            let decided = self.decideMode(from: current)
+                            self.sessionMode = decided == .initial ? .streaming : decided
+                            NSLog("SonarDictate: session mode -> \(self.sessionMode.rawValue) (on isFinal)")
+                        }
+                        if self.sessionMode == .streaming {
+                            self.streamEmit(target: current, isFinal: true)
+                        }
                         self.finalize(transcript: current)
                     }
                 } else {
-                    // Hold back the trailing word — most likely to get revised.
+                    // Decide mode as soon as we have stable signal (≥2 words
+                    // in the partial). Until then, don't stream anything.
+                    if self.sessionMode == .initial {
+                        let decided = self.decideMode(from: current)
+                        if decided != .initial {
+                            self.sessionMode = decided
+                            NSLog("SonarDictate: session mode -> \(decided.rawValue) (on partial: \(current.prefix(40)))")
+                        }
+                    }
+
+                    // Only emit in streaming mode. Buffering mode suppresses
+                    // injection until isFinal classifies and routes the action.
+                    guard self.sessionMode == .streaming else { return }
+
                     let words = current.split(separator: " ", omittingEmptySubsequences: false)
                     guard words.count >= 2 else { return }
                     let stable = words.dropLast().joined(separator: " ") + " "
@@ -156,6 +196,35 @@ final class Dictator {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         // isFinal callback flushes the tail and triggers finalize().
+    }
+
+    // Cheap classifier-prefix check used to decide whether to stream the
+    // session into the focused app or buffer it silently. Returns:
+    //   .initial   — not enough signal yet (single-word partial, or empty)
+    //   .buffering — first word matches a built-in trigger or a workflow
+    //                binding prefix (longest-prefix wins for workflows)
+    //   .streaming — first word is plain dictation; safe to stream
+    private func decideMode(from partial: String) -> SessionMode {
+        let trimmed = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .initial }
+
+        // A workflow binding prefix wins immediately, regardless of word count.
+        if workflows.match(trimmed) != nil {
+            return .buffering
+        }
+
+        let words = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+        // Need at least 2 words for a stable first-word decision in partial
+        // mode; the isFinal handler relaxes this and defaults to streaming.
+        guard words.count >= 2 else { return .initial }
+
+        let first = String(words[0])
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet.punctuationCharacters)
+        if TriggerRouter.defaultTriggers.contains(first) {
+            return .buffering
+        }
+        return .streaming
     }
 
     // Called once per session when isFinal=true.
@@ -175,15 +244,26 @@ final class Dictator {
         let action = TriggerRouter.classify(transcript, workflowStore: workflows)
         NSLog("SonarDictate: classified -> \(action)")
 
-        // If this was a user-defined workflow trigger, fire the workflow via
-        // /usr/bin/automator. The streaming inject already typed the trigger
-        // phrase into the focused app — backspace it now so the user doesn't
-        // see "rotate cert" sitting in their editor after the workflow runs.
-        if case let .runWorkflow(binding, input) = action {
+        // Backspace any streamed text if classification said this turned out
+        // to be a trigger (not plain dictation). In buffering mode nothing
+        // was typed, so this is a no-op. In streaming mode we erase what we
+        // emitted so the focused app doesn't keep the trigger phrase.
+        let isTriggerAction: Bool = {
+            switch action {
+            case .dictate: return false
+            default:       return true
+            }
+        }()
+        if isTriggerAction && sessionMode == .streaming && !emittedText.isEmpty {
             let toBackspace = emittedText.count
             emittedText = ""
-            if toBackspace > 0 { backspace(count: toBackspace) }
+            backspace(count: toBackspace)
+        }
 
+        // Fire any workflow binding asynchronously so we don't block this
+        // method on /usr/bin/automator. Other action types (yo, claude, etc)
+        // currently just log — real handlers come later.
+        if case let .runWorkflow(binding, input) = action {
             let store = self.workflows
             Task.detached(priority: .userInitiated) {
                 do {
