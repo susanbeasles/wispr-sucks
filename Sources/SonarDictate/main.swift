@@ -51,6 +51,10 @@ final class Dictator {
     private var sessionAppContext: String?
     private var finalPersisted = false  // guard so we persist once per session
 
+    // Optional menu-bar UI (set after construction); we call it on listening
+    // start/stop and after each session finalize to refresh counts.
+    var statusItem: StatusItemController?
+
     init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex) {
         self.store = store
         self.workflows = workflows
@@ -92,10 +96,12 @@ final class Dictator {
             if nowDown && !self.isOptionDown {
                 self.isOptionDown = true
                 NSLog("SonarDictate: Option DOWN — startListening")
+                self.statusItem?.setListening(true)
                 self.startListening()
             } else if !nowDown && self.isOptionDown {
                 self.isOptionDown = false
                 NSLog("SonarDictate: Option UP — stopListening")
+                self.statusItem?.setListening(false)
                 self.stopListening()
             }
         }
@@ -323,6 +329,9 @@ final class Dictator {
                 NSLog("SonarDictate: RAG embedding model not ready yet; transcript queued via store and can be re-indexed later")
             }
         }
+
+        // Refresh menu-bar counts (off the audio queue, on main).
+        statusItem?.refreshCounts()
     }
 
     // Serialize accumulated PCM buffers to WAV bytes via a temp file.
@@ -602,5 +611,7 @@ do {
 }
 
 let dictator = Dictator(store: store, workflows: workflows, rag: rag)
+let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
+dictator.statusItem = statusItem
 dictator.bootstrap()
 NSApplication.shared.run()
