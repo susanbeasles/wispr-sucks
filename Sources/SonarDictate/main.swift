@@ -30,11 +30,10 @@ enum SessionMode: String {
     case buffering  // first word looked trigger-shaped; suppress injection
 }
 
+@available(macOS 26.0, *)
 final class Dictator {
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
+    private let session = SpeechAnalyzerSession(locale: Locale(identifier: "en-US"))
     private let engine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
     private var isOptionDown = false
     private var emittedText = ""
 
@@ -62,11 +61,18 @@ final class Dictator {
     }
 
     func bootstrap() {
-        NSLog("SonarDictate: bootstrap()")
+        NSLog("SonarDictate: bootstrap() (engine=SpeechAnalyzer)")
 
-        guard recognizer.supportsOnDeviceRecognition else {
-            NSLog("SonarDictate: on-device recognition NOT supported on this Mac")
-            exit(1)
+        // Wire session callbacks. SpeechAnalyzer gives us a single
+        // "current best transcript so far" string after each result;
+        // we route that into the existing partial/final flow.
+        session.onTranscriptUpdate = { [weak self] transcript, isFinal in
+            DispatchQueue.main.async {
+                self?.handleTranscript(transcript, isFinal: isFinal)
+            }
+        }
+        session.onError = { error in
+            NSLog("SonarDictate: speech session error: \(error)")
         }
 
         // Explicit Accessibility trust check. Without this, addGlobalMonitorForEvents
@@ -79,6 +85,7 @@ final class Dictator {
             NSLog("SonarDictate: System Settings → Privacy & Security → Accessibility → enable SonarDictate, then restart this app.")
         }
 
+        // Speech Recognition TCC permission is still required by SpeechAnalyzer.
         SFSpeechRecognizer.requestAuthorization { status in
             NSLog("SonarDictate: Speech auth status raw=\(status.rawValue)")
             guard status == .authorized else {
@@ -109,9 +116,6 @@ final class Dictator {
     }
 
     private func startListening() {
-        request = SFSpeechAudioBufferRecognitionRequest()
-        request?.shouldReportPartialResults = true
-        request?.requiresOnDeviceRecognition = true  // thesis line — never falls back to cloud
         emittedText = ""
         sessionMode = .initial
         audioFrames.removeAll()
@@ -120,88 +124,83 @@ final class Dictator {
         sessionAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
         // Seed the recognizer with vocabulary biased toward what this user has
-        // said recently in this app context. Costs ~5ms for a few-hundred-item
-        // index; no-op when the RAG store is empty (first runs).
+        // said recently in this app context. SpeechAnalyzer's AnalysisContext
+        // takes a tagged-string map; we feed it via session.setContextualStrings().
         if rag.assetsReady, rag.count > 0 {
             do {
                 let bias = try rag.vocabularyBias(forContext: sessionAppContext, k: 8)
+                session.setContextualStrings(bias)
                 if !bias.isEmpty {
-                    request?.contextualStrings = bias
                     NSLog("SonarDictate: biased recognizer with \(bias.count) terms from RAG")
                 }
             } catch {
                 NSLog("SonarDictate: RAG bias skipped: \(error)")
             }
+        } else {
+            session.setContextualStrings([])  // clear stale bias from previous session
         }
 
         let format = engine.inputNode.outputFormat(forBus: 0)
         sessionFormat = format
         engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.request?.append(buffer)
-            if let copy = self?.copy(of: buffer) {
-                self?.audioFrames.append(copy)
+            guard let self else { return }
+            // Clone the buffer once; the audio engine reuses its storage.
+            // Both the SpeechAnalyzer session and our local WAV serialization
+            // need their own retained copy.
+            if let copy = self.copy(of: buffer) {
+                self.audioFrames.append(copy)
+                self.session.append(buffer: copy)
             }
         }
 
         do {
             engine.prepare()
             try engine.start()
-            task = recognizer.recognitionTask(with: request!) { [weak self] result, error in
-                guard let self else { return }
-                if let error = error {
-                    NSLog("SonarDictate: recognitionTask error: \(error.localizedDescription)")
-                }
-                guard let result = result else { return }
-                let current = result.bestTranscription.formattedString
-
-                if result.isFinal {
-                    DispatchQueue.main.async {
-                        // If we never committed a mode (short utterance: only
-                        // 1 word ever, or recognizer never produced a multi-
-                        // word partial before isFinal), decide now from the
-                        // final transcript. Default to streaming if still
-                        // ambiguous so plain dictation still injects.
-                        if self.sessionMode == .initial {
-                            let decided = self.decideMode(from: current)
-                            self.sessionMode = decided == .initial ? .streaming : decided
-                            NSLog("SonarDictate: session mode -> \(self.sessionMode.rawValue) (on isFinal)")
-                        }
-                        if self.sessionMode == .streaming {
-                            self.streamEmit(target: current, isFinal: true)
-                        }
-                        self.finalize(transcript: current)
-                    }
-                } else {
-                    // Decide mode as soon as we have stable signal (≥2 words
-                    // in the partial). Until then, don't stream anything.
-                    if self.sessionMode == .initial {
-                        let decided = self.decideMode(from: current)
-                        if decided != .initial {
-                            self.sessionMode = decided
-                            NSLog("SonarDictate: session mode -> \(decided.rawValue) (on partial: \(current.prefix(40)))")
-                        }
-                    }
-
-                    // Only emit in streaming mode. Buffering mode suppresses
-                    // injection until isFinal classifies and routes the action.
-                    guard self.sessionMode == .streaming else { return }
-
-                    let words = current.split(separator: " ", omittingEmptySubsequences: false)
-                    guard words.count >= 2 else { return }
-                    let stable = words.dropLast().joined(separator: " ") + " "
-                    DispatchQueue.main.async { self.streamEmit(target: stable, isFinal: false) }
-                }
-            }
+            try session.start()
         } catch {
             NSLog("SonarDictate: audio start failed: \(error.localizedDescription)")
         }
     }
 
     private func stopListening() {
-        request?.endAudio()
+        session.stop()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-        // isFinal callback flushes the tail and triggers finalize().
+        // The transcriber's results stream drains naturally after audio
+        // input is finished; its final emission triggers finalize() via
+        // handleTranscript(isFinal: true).
+    }
+
+    // Called from the SpeechAnalyzer session's onTranscriptUpdate callback,
+    // marshalled onto the main thread. Decides session mode (streaming vs
+    // buffering for trigger detection), streams stable text into the
+    // focused app, and on isFinal=true triggers finalize().
+    private func handleTranscript(_ current: String, isFinal: Bool) {
+        if isFinal {
+            if sessionMode == .initial {
+                let decided = decideMode(from: current)
+                sessionMode = decided == .initial ? .streaming : decided
+                NSLog("SonarDictate: session mode -> \(sessionMode.rawValue) (on isFinal)")
+            }
+            if sessionMode == .streaming {
+                streamEmit(target: current, isFinal: true)
+            }
+            finalize(transcript: current)
+        } else {
+            if sessionMode == .initial {
+                let decided = decideMode(from: current)
+                if decided != .initial {
+                    sessionMode = decided
+                    NSLog("SonarDictate: session mode -> \(decided.rawValue) (on partial: \(current.prefix(40)))")
+                }
+            }
+            guard sessionMode == .streaming else { return }
+            // SpeechAnalyzer's progressiveTranscription gives us stable
+            // text per chunk — no need for our manual word-holdback that
+            // SFSpeechRecognizer required. streamEmit's diff logic still
+            // handles any revisions via backspace.
+            streamEmit(target: current, isFinal: false)
+        }
     }
 
     // Cheap classifier-prefix check used to decide whether to stream the
@@ -610,8 +609,13 @@ do {
     exit(1)
 }
 
-let dictator = Dictator(store: store, workflows: workflows, rag: rag)
-let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
-dictator.statusItem = statusItem
-dictator.bootstrap()
-NSApplication.shared.run()
+if #available(macOS 26.0, *) {
+    let dictator = Dictator(store: store, workflows: workflows, rag: rag)
+    let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
+    dictator.statusItem = statusItem
+    dictator.bootstrap()
+    NSApplication.shared.run()
+} else {
+    NSLog("SonarDictate requires macOS 26.0+ (SpeechAnalyzer is unavailable on this OS)")
+    exit(1)
+}
