@@ -8,23 +8,15 @@ import CoreMedia
 // Why this exists vs. SFSpeechRecognizer:
 //   - Partial cadence ~50–100ms instead of 200–500ms (sub-network-RTT,
 //     so we beat any cloud streaming product on perceived latency).
-//   - Native volatile/final result distinction via per-result CMTimeRange
-//     (no manual word-holdback heuristic).
+//   - Native volatile/final result distinction via per-result CMTimeRange.
 //   - Apple ships the model on macOS 26+; nothing to install.
 //
-// Architecture:
-//   - Audio in: AsyncStream<AnalyzerInput>. Caller yields PCM buffers
-//     via append(buffer:); we wrap them as AnalyzerInput.
-//   - Results out: an async Task iterating transcriber.results and
-//     assembling overlapping volatile chunks into a single "current
-//     best transcript so far" string. onTranscriptUpdate is called
-//     with that string after every result.
-//   - Each result has a CMTimeRange. Earlier results that get
-//     superseded by later results (volatile revisions of the same
-//     range) are replaced. Final results extend the timeline.
-//   - Cleanest assembly: keep a sorted map [CMTime: String] keyed by
-//     range start. Each result writes to its key; concatenate values
-//     in time order to get the current transcript.
+// AUDIO FORMAT (load-bearing — see git history): SpeechAnalyzer traps with
+// EXC_BREAKPOINT inside preRunRecognition() if fed an incompatible PCM
+// format. The mic input node is typically 48kHz Float32; the transcriber
+// wants whatever bestAvailableAudioFormat reports. We negotiate that format
+// at start() and run every buffer through an AVAudioConverter before feeding
+// AnalyzerInput. Do NOT feed raw mic buffers directly — it crashes.
 
 @available(macOS 26.0, *)
 final class SpeechAnalyzerSession {
@@ -37,14 +29,15 @@ final class SpeechAnalyzerSession {
     private var analyzerTask: Task<Void, Never>?
     private var resultsTask: Task<Void, Never>?
 
-    // Range-keyed transcript chunks. We use the CMTime seconds (rounded
-    // to ms) as the dictionary key so volatile revisions of the same
-    // range start replace the previous value cleanly.
+    // Audio format conversion: mic format → transcriber-compatible format.
+    private var converter: AVAudioConverter?
+    private var analyzerFormat: AVAudioFormat?
+
+    // Range-keyed transcript chunks (CMTime seconds rounded to ms as key) so
+    // volatile revisions of the same range start replace cleanly.
     private var chunks: [Double: String] = [:]
     private let chunksQueue = DispatchQueue(label: "sonar-dictate.speech.chunks")
 
-    // Caller hooks. Called from a background queue; caller is
-    // responsible for marshalling to the main thread if needed.
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
     var onError: (@Sendable (Error) -> Void)?
 
@@ -52,17 +45,29 @@ final class SpeechAnalyzerSession {
         self.locale = locale
     }
 
-    // Pre-session vocabulary bias. Re-call before each start() to update.
     func setContextualStrings(_ strings: [String]) {
         context.contextualStrings[.general] = strings
     }
 
-    func start() throws {
-        let transcriber = SpeechTranscriber(
-            locale: locale,
-            preset: .progressiveTranscription
-        )
+    // Async because format negotiation (bestAvailableAudioFormat) is async and
+    // MUST complete before any audio is fed. Caller starts the AVAudioEngine
+    // only AFTER this returns, so no buffer reaches append() before the
+    // converter exists.
+    func start(inputFormat: AVAudioFormat) async throws {
+        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
         self.transcriber = transcriber
+
+        // Negotiate the transcriber-compatible audio format and build the
+        // converter from the mic format to it.
+        let negotiated = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        self.analyzerFormat = negotiated
+        if let negotiated, negotiated != inputFormat {
+            self.converter = AVAudioConverter(from: inputFormat, to: negotiated)
+            NSLog("SonarDictate: audio convert \(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> \(Int(negotiated.sampleRate))Hz/\(negotiated.channelCount)ch")
+        } else {
+            self.converter = nil
+            NSLog("SonarDictate: mic format already transcriber-compatible (\(Int(inputFormat.sampleRate))Hz)")
+        }
 
         let (audioStream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
         self.audioContinuation = continuation
@@ -70,36 +75,28 @@ final class SpeechAnalyzerSession {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
 
-        // Reset chunks for this session.
         chunksQueue.sync { self.chunks.removeAll() }
 
-        // Consume results in a task; assemble running transcript on every result.
         resultsTask = Task { [weak self] in
             guard let self else { return }
             do {
                 for try await result in transcriber.results {
                     self.handle(result: result)
                 }
-                // Stream ended → flush as final
                 self.emitTranscript(isFinal: true)
             } catch is CancellationError {
-                // Normal cancel from stop()
+                // normal cancel from stop()
             } catch {
                 NSLog("SonarDictate: transcriber.results error: \(error)")
                 self.onError?(error)
             }
         }
 
-        // Start the analyzer feeding from the audio stream. We pass the
-        // context via the convenience init that accepts both. start() is
-        // async; spawn it in a task so the caller can return immediately.
-        let analysisContext = self.context
         analyzerTask = Task { [weak self] in
             do {
                 try await analyzer.start(inputSequence: audioStream)
-                _ = analysisContext  // capture
             } catch is CancellationError {
-                // Normal cancel from stop()
+                // normal cancel from stop()
             } catch {
                 NSLog("SonarDictate: analyzer.start error: \(error)")
                 self?.onError?(error)
@@ -107,37 +104,65 @@ final class SpeechAnalyzerSession {
         }
     }
 
-    // Caller invokes from the AVAudioEngine tap.
+    // Called from the AVAudioEngine tap (realtime audio thread). Converts the
+    // mic buffer to the transcriber-compatible format, then feeds it.
     func append(buffer: AVAudioPCMBuffer) {
-        audioContinuation?.yield(AnalyzerInput(buffer: buffer))
+        guard let continuation = audioContinuation else { return }
+        guard let converter, let outFormat = analyzerFormat else {
+            // No conversion needed (formats matched) — feed directly.
+            continuation.yield(AnalyzerInput(buffer: buffer))
+            return
+        }
+        guard let converted = convert(buffer, with: converter, to: outFormat) else { return }
+        continuation.yield(AnalyzerInput(buffer: converted))
     }
 
-    // Caller invokes after Option-up. We finish the audio stream; the
-    // analyzer drains in-flight audio, the results loop emits any final
-    // chunks, and the results task completes naturally.
     func stop() {
         audioContinuation?.finish()
         audioContinuation = nil
-        // Don't cancel the resultsTask — let it drain so the user's
-        // last words come through.
+        // Let resultsTask drain so the user's last words come through.
     }
 
     // MARK: - Internals
 
+    private func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, to outFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let ratio = outFormat.sampleRate / input.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 1024
+        guard let output = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else {
+            return nil
+        }
+
+        var consumed = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return input
+        }
+
+        if let error {
+            NSLog("SonarDictate: audio conversion error: \(error.localizedDescription)")
+            return nil
+        }
+        if status == .error { return nil }
+        return output.frameLength > 0 ? output : nil
+    }
+
     private func handle(result: SpeechTranscriber.Result) {
         let plain = String(result.text.characters)
         let key = result.range.start.seconds.rounded(toMilliseconds: 3)
-        chunksQueue.sync {
-            self.chunks[key] = plain
-        }
+        chunksQueue.sync { self.chunks[key] = plain }
         emitTranscript(isFinal: false)
     }
 
     private func emitTranscript(isFinal: Bool) {
         let snapshot: [Double: String] = chunksQueue.sync { self.chunks }
-        // Assemble in time order
-        let sortedKeys = snapshot.keys.sorted()
-        let assembled = sortedKeys.compactMap { snapshot[$0] }
+        let assembled = snapshot.keys.sorted()
+            .compactMap { snapshot[$0] }
             .joined(separator: " ")
             .replacingOccurrences(of: "  ", with: " ")
         onTranscriptUpdate?(assembled, isFinal)

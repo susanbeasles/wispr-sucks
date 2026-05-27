@@ -164,19 +164,28 @@ final class Dictator {
             guard let self else { return }
             // Clone the buffer once; the audio engine reuses its storage.
             // Both the SpeechAnalyzer session and our local WAV serialization
-            // need their own retained copy.
+            // need their own retained copy. session.append() converts to the
+            // transcriber-compatible format internally; audioFrames keeps the
+            // raw mic-format audio for WAV storage.
             if let copy = self.copy(of: buffer) {
                 self.audioFrames.append(copy)
                 self.session.append(buffer: copy)
             }
         }
 
-        do {
-            engine.prepare()
-            try engine.start()
-            try session.start()
-        } catch {
-            NSLog("SonarDictate: audio start failed: \(error.localizedDescription)")
+        // session.start(inputFormat:) is async — it negotiates the transcriber-
+        // compatible audio format and builds the converter. The engine must NOT
+        // start until that's done, or raw 48kHz mic buffers reach SpeechAnalyzer
+        // before the converter exists and it traps in preRunRecognition().
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.session.start(inputFormat: format)
+                self.engine.prepare()
+                try self.engine.start()
+            } catch {
+                NSLog("SonarDictate: audio start failed: \(error.localizedDescription)")
+            }
         }
     }
 
