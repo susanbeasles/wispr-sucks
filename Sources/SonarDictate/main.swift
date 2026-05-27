@@ -57,6 +57,13 @@ final class Dictator {
     // In-your-eyeline floating overlay shown while Option is held.
     var overlay: RecordingOverlay?
 
+    // Draggable chip that holds captured text when no field is focused at
+    // commit time. User double-spaces in a field to drop it in.
+    var chip: TextChip?
+
+    // Double-space commit detection: timestamp of the last space keyDown.
+    private var lastSpaceDown: TimeInterval = 0
+
     // Optional on-device Foundation Models cleanup pass (opt-in per app).
     private let cleanup = Cleanup()
     private var sessionNeedsCleanup = false
@@ -121,7 +128,37 @@ final class Dictator {
                 self.stopListening()
             }
         }
-        NSLog("SonarDictate: Ready. Focus any app, hold Option to talk, release to stop.")
+        // Separate keyDown monitor for the double-space commit gesture. We
+        // only ACT on it when the chip is showing pending text — so normal
+        // double-spaces you type (sentence ends, etc.) do nothing unless a
+        // captured chip is waiting to be dropped. We never store or inspect
+        // any other keystroke; this watches the space keycode only.
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self else { return }
+            guard event.keyCode == 49 else { return }   // 49 = kVK_Space
+            guard self.chip?.isShowing == true else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - self.lastSpaceDown < 0.4 {
+                self.lastSpaceDown = 0
+                self.commitChip()
+            } else {
+                self.lastSpaceDown = now
+            }
+        }
+
+        NSLog("SonarDictate: Ready. Hold Option to talk, release to capture. Double-space to drop the chip into a field.")
+    }
+
+    // Commit the chip's pending text into the currently focused field, then
+    // hide the chip. Removes the two literal spaces the user just typed (the
+    // double-space gesture) before injecting, so the gesture itself leaves no
+    // residue.
+    private func commitChip() {
+        guard let text = chip?.pendingText else { return }
+        NSLog("SonarDictate: double-space commit -> injecting \(text.count) chars from chip")
+        backspace(count: 2)        // remove the two spaces the gesture typed
+        inject(text)
+        chip?.hide()
     }
 
     private func startListening() {
@@ -199,59 +236,14 @@ final class Dictator {
     }
 
     // Called from the SpeechAnalyzer session's onTranscriptUpdate callback,
-    // marshalled onto the main thread. Decides session mode (streaming vs
-    // buffering for trigger detection), streams stable text into the
-    // focused app, and on isFinal=true triggers finalize().
+    // marshalled onto the main thread. Commit-at-end model: partials only
+    // update the overlay; nothing is injected mid-speech. On isFinal,
+    // finalize() classifies and routes the whole transcript (direct inject
+    // into a focused field, park in the chip, or fire a trigger action).
     private func handleTranscript(_ current: String, isFinal: Bool) {
-        // Update the floating overlay so the user can see what's being
-        // transcribed in real time, regardless of mode.
         overlay?.updateTranscript(current)
-
-        // Cleanup mode: never stream. Buffer silently, then on finalize run the
-        // Foundation Models cleanup pass and inject the polished transcript in
-        // one shot. (The overlay still shows live text above, so the user sees
-        // recognition happening even though nothing is typed yet.)
-        if sessionNeedsCleanup {
-            overlay?.setBufferingMode(true)
-            if isFinal {
-                let raw = current
-                Task { [weak self] in
-                    guard let self else { return }
-                    let cleaned = await self.cleanup.clean(raw)
-                    await MainActor.run { self.inject(cleaned) }
-                }
-                finalize(transcript: current)
-            }
-            return
-        }
-
-        if isFinal {
-            if sessionMode == .initial {
-                let decided = decideMode(from: current)
-                sessionMode = decided == .initial ? .streaming : decided
-                NSLog("SonarDictate: session mode -> \(sessionMode.rawValue) (on isFinal)")
-                overlay?.setBufferingMode(sessionMode == .buffering)
-            }
-            if sessionMode == .streaming {
-                streamEmit(target: current, isFinal: true)
-            }
-            finalize(transcript: current)
-        } else {
-            if sessionMode == .initial {
-                let decided = decideMode(from: current)
-                if decided != .initial {
-                    sessionMode = decided
-                    NSLog("SonarDictate: session mode -> \(decided.rawValue) (on partial: \(current.prefix(40)))")
-                    overlay?.setBufferingMode(decided == .buffering)
-                }
-            }
-            guard sessionMode == .streaming else { return }
-            // SpeechAnalyzer's progressiveTranscription gives us stable
-            // text per chunk — no need for our manual word-holdback that
-            // SFSpeechRecognizer required. streamEmit's diff logic still
-            // handles any revisions via backspace.
-            streamEmit(target: current, isFinal: false)
-        }
+        guard isFinal else { return }
+        finalize(transcript: current)
     }
 
     // Cheap classifier-prefix check used to decide whether to stream the
@@ -300,26 +292,15 @@ final class Dictator {
         let action = TriggerRouter.classify(transcript, workflowStore: workflows)
         NSLog("SonarDictate: classified -> \(action)")
 
-        // Backspace any streamed text if classification said this turned out
-        // to be a trigger (not plain dictation). In buffering mode nothing
-        // was typed, so this is a no-op. In streaming mode we erase what we
-        // emitted so the focused app doesn't keep the trigger phrase.
-        let isTriggerAction: Bool = {
-            switch action {
-            case .dictate: return false
-            default:       return true
-            }
-        }()
-        if isTriggerAction && sessionMode == .streaming && !emittedText.isEmpty {
-            let toBackspace = emittedText.count
-            emittedText = ""
-            backspace(count: toBackspace)
-        }
-
-        // Fire any workflow binding asynchronously so we don't block this
-        // method on /usr/bin/automator. Other action types (yo, claude, etc)
-        // currently just log — real handlers come later.
-        if case let .runWorkflow(binding, input) = action {
+        // Route the result:
+        //   - plain dictation → commit (direct inject if a field is focused,
+        //     else park in the draggable chip for later double-space commit)
+        //   - workflow binding → fire it via automator, never inject text
+        //   - other triggers (yo/claude/note/todo) → log for now
+        switch action {
+        case .dictate(let text):
+            commitDictation(text)
+        case let .runWorkflow(binding, input):
             let store = self.workflows
             Task.detached(priority: .userInitiated) {
                 do {
@@ -329,6 +310,8 @@ final class Dictator {
                     NSLog("SonarDictate: workflow '\(binding.name)' failed: \(error)")
                 }
             }
+        default:
+            NSLog("SonarDictate: action \(action) — handler not implemented yet")
         }
 
         // Persist asynchronously so we don't block the recognition callback
@@ -445,6 +428,61 @@ final class Dictator {
             inject(target)
             emittedText = target
         }
+    }
+
+    // Commit a finalized plain-dictation transcript. Runs the optional cleanup
+    // pass first (per-app), then routes to direct-inject or the chip.
+    private func commitDictation(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if sessionNeedsCleanup {
+            Task { [weak self] in
+                guard let self else { return }
+                let cleaned = await self.cleanup.clean(trimmed)
+                await MainActor.run { self.commit(cleaned) }
+            }
+        } else {
+            commit(trimmed)
+        }
+    }
+
+    // Direct-inject if an editable field is focused ("shoot for the stars");
+    // otherwise park the text in the draggable chip.
+    private func commit(_ text: String) {
+        if isEditableFieldFocused() {
+            NSLog("SonarDictate: editable field focused -> direct inject")
+            inject(text)
+        } else {
+            NSLog("SonarDictate: no editable field focused -> chip")
+            chip?.present(text)
+        }
+    }
+
+    // Asks the Accessibility API whether the system-wide focused element is an
+    // editable text control. Requires the Accessibility grant (which we already
+    // need for keystroke injection).
+    private func isEditableFieldFocused() -> Bool {
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused else { return false }
+        let element = focused as! AXUIElement
+
+        var roleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+        let role = (roleRef as? String) ?? ""
+        let editableRoles: Set<String> = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            kAXComboBoxRole as String,
+        ]
+        if editableRoles.contains(role) { return true }
+
+        // Fallback for web/Electron inputs that report odd roles: treat as
+        // editable if the focused element's AXValue is settable.
+        var settable: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
+        return settable.boolValue
     }
 
     private func inject(_ text: String) {
@@ -680,8 +718,10 @@ if #available(macOS 26.0, *) {
     let dictator = Dictator(store: store, workflows: workflows, rag: rag)
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
     let overlay = RecordingOverlay()
+    let chip = TextChip()
     dictator.statusItem = statusItem
     dictator.overlay = overlay
+    dictator.chip = chip
     dictator.bootstrap()
     NSApplication.shared.run()
 } else {
