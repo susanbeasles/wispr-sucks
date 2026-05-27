@@ -448,11 +448,24 @@ final class Dictator {
     }
 
     private func inject(_ text: String) {
+        guard !text.isEmpty else { return }
+        // Diagnostic: confirms inject is reached + whether we're trusted to
+        // synthesize input. AXIsProcessTrusted() == false here means the
+        // Accessibility grant (separate from Input Monitoring) is missing and
+        // every post() below is silently dropped.
+        NSLog("SonarDictate: inject \(text.count) chars (AXtrusted=\(AXIsProcessTrusted()))")
+
         let source = CGEventSource(stateID: .hidSystemState)
         for char in Array(text.utf16) {
             var ch = char
             let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
             let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+            // CRITICAL: clear modifier flags. The user is physically holding
+            // Option (our hotkey) while we stream-inject, so without this the
+            // synthesized events become Option+<char> and produce dead keys /
+            // nothing instead of the literal text.
+            down?.flags = []
+            up?.flags = []
             down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &ch)
             up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &ch)
             down?.post(tap: .cghidEventTap)
@@ -461,11 +474,14 @@ final class Dictator {
     }
 
     private func backspace(count: Int) {
+        guard count > 0 else { return }
         let source = CGEventSource(stateID: .hidSystemState)
         let deleteKey: CGKeyCode = 0x33  // kVK_Delete (backspace)
         for _ in 0..<count {
             let down = CGEvent(keyboardEventSource: source, virtualKey: deleteKey, keyDown: true)
             let up = CGEvent(keyboardEventSource: source, virtualKey: deleteKey, keyDown: false)
+            down?.flags = []  // same modifier-clearing fix as inject()
+            up?.flags = []
             down?.post(tap: .cghidEventTap)
             up?.post(tap: .cghidEventTap)
         }
