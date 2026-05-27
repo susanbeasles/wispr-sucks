@@ -57,6 +57,10 @@ final class Dictator {
     // In-your-eyeline floating overlay shown while Option is held.
     var overlay: RecordingOverlay?
 
+    // Optional on-device Foundation Models cleanup pass (opt-in per app).
+    private let cleanup = Cleanup()
+    private var sessionNeedsCleanup = false
+
     init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex) {
         self.store = store
         self.workflows = workflows
@@ -128,6 +132,15 @@ final class Dictator {
         finalPersisted = false
         sessionAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
+        // Decide cleanup at session start (we know the focused app now). When a
+        // cleanup app is focused, we suppress streaming entirely and inject a
+        // single cleaned transcript on finalize. For everything else (default,
+        // incl. all LLM clients) we stream raw as before.
+        sessionNeedsCleanup = Cleanup.shouldClean(appContext: sessionAppContext)
+        if sessionNeedsCleanup {
+            NSLog("SonarDictate: cleanup mode ON for \(sessionAppContext ?? "?") — buffering, will clean on finalize")
+        }
+
         // Seed the recognizer with vocabulary biased toward what this user has
         // said recently in this app context. SpeechAnalyzer's AnalysisContext
         // takes a tagged-string map; we feed it via session.setContextualStrings().
@@ -184,6 +197,24 @@ final class Dictator {
         // Update the floating overlay so the user can see what's being
         // transcribed in real time, regardless of mode.
         overlay?.updateTranscript(current)
+
+        // Cleanup mode: never stream. Buffer silently, then on finalize run the
+        // Foundation Models cleanup pass and inject the polished transcript in
+        // one shot. (The overlay still shows live text above, so the user sees
+        // recognition happening even though nothing is typed yet.)
+        if sessionNeedsCleanup {
+            overlay?.setBufferingMode(true)
+            if isFinal {
+                let raw = current
+                Task { [weak self] in
+                    guard let self else { return }
+                    let cleaned = await self.cleanup.clean(raw)
+                    await MainActor.run { self.inject(cleaned) }
+                }
+                finalize(transcript: current)
+            }
+            return
+        }
 
         if isFinal {
             if sessionMode == .initial {
