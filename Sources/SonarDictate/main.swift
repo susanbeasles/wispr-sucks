@@ -40,6 +40,20 @@ final class Dictator {
     // Per-session injection mode (see SessionMode above)
     private var sessionMode: SessionMode = .initial
 
+    // True between Option-down and Option-up. The async session.start() can take
+    // ~2s to negotiate the audio format; if the user releases before it finishes
+    // we must NOT start the engine (that's the rapid start/stop race that left a
+    // dangling analyzer and killed the next session's finalize). The start Task
+    // re-checks this after the await.
+    private var listening = false
+
+    // When true, partials are live-typed into the focused field (the "typing as
+    // I talk" feel) instead of buffered for commit-on-release. Decided once at
+    // session start: only when there's NO selector broadcast, a field IS focused,
+    // and no cleanup pass is pending (cleanup rewrites the whole transcript at the
+    // end, so it can't stream). Selector/chip paths stay commit-at-end.
+    private var streamingIntoField = false
+
     // Persistence
     private let store: SecureStore
     private let workflows: WorkflowStore
@@ -60,6 +74,11 @@ final class Dictator {
     // Draggable chip that holds captured text when no field is focused at
     // commit time. User double-spaces in a field to drop it in.
     var chip: TextChip?
+
+    // Gold see-through-windows highlight drawn over every selector target so
+    // the user can see exactly what a dictation will broadcast to. Refreshed
+    // after every selector mutation.
+    var highlighter: FieldHighlighter?
 
     // Double-space commit detection: timestamp of the last space keyDown.
     private var lastSpaceDown: TimeInterval = 0
@@ -147,6 +166,7 @@ final class Dictator {
             if ctrlOpt, event.keyCode == 37 {  // 37 = kVK_ANSI_L
                 if let label = self.selector.addFocused() {
                     NSLog("SonarDictate: + target '\(label)' (selector now \(self.selector.count))")
+                    self.highlighter?.update(targets: self.selector.targets)
                 } else {
                     NSLog("SonarDictate: ⌃⌥L — focused element not editable / already in set")
                 }
@@ -155,12 +175,14 @@ final class Dictator {
             // ⌃⌥K → wipe the selector.
             if ctrlOpt, event.keyCode == 40 {  // 40 = kVK_ANSI_K
                 self.selector.wipe()
+                self.highlighter?.clear()
                 NSLog("SonarDictate: selector WIPED")
                 return
             }
             // ⌃⌥⌫ → remove the last target.
             if ctrlOpt, event.keyCode == 51 {  // 51 = kVK_Delete
                 self.selector.removeLast()
+                self.highlighter?.update(targets: self.selector.targets)
                 NSLog("SonarDictate: removed last target (selector now \(self.selector.count))")
                 return
             }
@@ -186,6 +208,7 @@ final class Dictator {
             guard let self, self.isOptionDown else { return }
             if let label = self.selector.addElement(atCocoaPoint: NSEvent.mouseLocation) {
                 NSLog("SonarDictate: + target '\(label)' via click (selector now \(self.selector.count))")
+                self.highlighter?.update(targets: self.selector.targets)
             }
         }
 
@@ -205,6 +228,7 @@ final class Dictator {
     }
 
     private func startListening() {
+        listening = true
         emittedText = ""
         sessionMode = .initial
         audioFrames.removeAll()
@@ -220,6 +244,13 @@ final class Dictator {
         if sessionNeedsCleanup {
             NSLog("SonarDictate: cleanup mode ON for \(sessionAppContext ?? "?") — buffering, will clean on finalize")
         }
+
+        // Decide live-typing vs commit-at-end NOW (we know focus + selector state).
+        // Stream into a single focused field for the real-time "typing as I talk"
+        // feel; otherwise buffer and route on release (broadcast to N targets, or
+        // park in the chip, or clean-then-inject).
+        streamingIntoField = selector.isEmpty && !sessionNeedsCleanup && isEditableFieldFocused()
+        NSLog("SonarDictate: mode = \(streamingIntoField ? "STREAM into focused field" : (selector.isEmpty ? "commit-at-end (chip/inject)" : "broadcast \(selector.count) target(s)"))")
 
         // Seed the recognizer with vocabulary biased toward what this user has
         // said recently in this app context. SpeechAnalyzer's AnalysisContext
@@ -240,6 +271,9 @@ final class Dictator {
 
         let format = engine.inputNode.outputFormat(forBus: 0)
         sessionFormat = format
+        // Remove any tap left over from a racy prior session before installing —
+        // AVAudioEngine throws if a bus already has a tap.
+        engine.inputNode.removeTap(onBus: 0)
         engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             // Clone the buffer once; the audio engine reuses its storage.
@@ -261,6 +295,15 @@ final class Dictator {
             guard let self else { return }
             do {
                 try await self.session.start(inputFormat: format)
+                // If Option was released while start() was negotiating, abort:
+                // starting the engine now would orphan this session and corrupt
+                // the next one (the rapid start/stop race).
+                guard self.listening else {
+                    NSLog("SonarDictate: released before audio start finished — aborting session")
+                    self.session.stop()
+                    self.engine.inputNode.removeTap(onBus: 0)
+                    return
+                }
                 self.engine.prepare()
                 try self.engine.start()
             } catch {
@@ -270,8 +313,9 @@ final class Dictator {
     }
 
     private func stopListening() {
+        listening = false
         session.stop()
-        engine.stop()
+        if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
         // The transcriber's results stream drains naturally after audio
         // input is finished; its final emission triggers finalize() via
@@ -279,12 +323,40 @@ final class Dictator {
     }
 
     // Called from the SpeechAnalyzer session's onTranscriptUpdate callback,
-    // marshalled onto the main thread. Commit-at-end model: partials only
-    // update the overlay; nothing is injected mid-speech. On isFinal,
-    // finalize() classifies and routes the whole transcript (direct inject
-    // into a focused field, park in the chip, or fire a trigger action).
+    // marshalled onto the main thread.
+    //
+    // Two models, chosen at session start (streamingIntoField):
+    //   - STREAM: live-type each partial into the focused field via streamEmit
+    //     (the "typing as I talk" feel), with trigger-buffering so a leading
+    //     trigger word isn't typed. On final, reconcile + persist (no re-route).
+    //   - COMMIT-AT-END: partials only update the overlay; on final, finalize()
+    //     classifies + routes (broadcast to N targets, inject, or chip).
     private func handleTranscript(_ current: String, isFinal: Bool) {
         overlay?.updateTranscript(current)
+
+        if streamingIntoField {
+            if sessionMode == .initial {
+                sessionMode = decideMode(from: current)
+            }
+            if !isFinal {
+                if sessionMode == .streaming {
+                    streamEmit(target: current, isFinal: false)
+                }
+                return
+            }
+            // Final.
+            if sessionMode == .streaming {
+                guard !finalPersisted else { return }
+                finalPersisted = true
+                streamEmit(target: current, isFinal: true)   // reconcile last delta
+                persistSession(transcript: current)          // already typed; just persist
+            } else {
+                // Leading trigger word (buffered) or too-short-to-decide: route it.
+                finalize(transcript: current)
+            }
+            return
+        }
+
         guard isFinal else { return }
         finalize(transcript: current)
     }
@@ -305,13 +377,12 @@ final class Dictator {
         }
 
         let words = trimmed.split(separator: " ", omittingEmptySubsequences: true)
-        // Need at least 2 words for a stable first-word decision in partial
-        // mode; the isFinal handler relaxes this and defaults to streaming.
-        guard words.count >= 2 else { return .initial }
-
         let first = String(words[0])
             .lowercased()
             .trimmingCharacters(in: CharacterSet.punctuationCharacters)
+        // Leading built-in trigger ("yo"/"claude"/"note"/"todo") → buffer so we
+        // don't live-type it. Otherwise stream from the very first word — waiting
+        // for a second word would add a visible one-word lag to the typing feel.
         if TriggerRouter.defaultTriggers.contains(first) {
             return .buffering
         }
@@ -324,12 +395,6 @@ final class Dictator {
     private func finalize(transcript: String) {
         guard !finalPersisted else { return }
         finalPersisted = true
-
-        let duration = sessionStart.map { -$0.timeIntervalSinceNow } ?? 0
-        let appCtx = sessionAppContext
-        let frames = audioFrames
-        let format = sessionFormat
-        audioFrames.removeAll()
 
         // Classify trigger (user-defined workflow bindings win over built-in triggers).
         let action = TriggerRouter.classify(transcript, workflowStore: workflows)
@@ -356,6 +421,20 @@ final class Dictator {
         default:
             NSLog("SonarDictate: action \(action) — handler not implemented yet")
         }
+
+        persistSession(transcript: transcript)
+    }
+
+    // Persist audio+transcript to SecureStore and ingest into the RAG index.
+    // Shared by the commit-at-end path (finalize) and the streaming path (where
+    // the text is already typed into the field). The caller owns the
+    // finalPersisted guard; this just does the heavy work off the main thread.
+    private func persistSession(transcript: String) {
+        let duration = sessionStart.map { -$0.timeIntervalSinceNow } ?? 0
+        let appCtx = sessionAppContext
+        let frames = audioFrames
+        let format = sessionFormat
+        audioFrames.removeAll()
 
         // Persist asynchronously so we don't block the recognition callback
         DispatchQueue.global(qos: .utility).async { [store, rag] in
@@ -497,7 +576,7 @@ final class Dictator {
         if !selector.isEmpty {
             NSLog("SonarDictate: broadcasting \(text.count) chars to \(selector.count) target(s): \(selector.summary)")
             for target in selector.targets {
-                writeToLocked(target.element, text: text)
+                broadcast(to: target, text: text)
             }
             return
         }
@@ -510,24 +589,38 @@ final class Dictator {
         }
     }
 
-    // Write to the locked field. Tries non-disruptive AX value-set first
-    // (appends to existing content); falls back to focus+keystroke-inject if
-    // that's rejected (web/Electron). Logs which path won so we learn whether
-    // the clean multi-broadcast is viable on the user's agent apps.
-    private func writeToLocked(_ element: AXUIElement, text: String) {
-        var currentRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &currentRef)
-        let current = (currentRef as? String) ?? ""
-        let combined = current.isEmpty ? text : current + " " + text
-
-        let err = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, combined as CFTypeRef)
-        if err == .success {
-            NSLog("SonarDictate: wrote \(text.count) chars to locked field via AX value-set (clean, no focus steal)")
+    // Deliver text to one selector target via the reliable keystroke path.
+    //
+    // We learned the hard way that AX value-set is silently ignored by Electron/
+    // web inputs (Claude, ChatGPT, Cursor, web textareas) — React never sees the
+    // change. So instead we do what a human does and what the single-field path
+    // already proved fast: CLICK the exact point the user clicked (which focuses
+    // the real input, even in Electron), let focus settle, then type. When there's
+    // no click point (a ⌃⌥L focused-add), fall back to AX setFocused.
+    private func broadcast(to target: SelectorEngine.Target, text: String) {
+        if let cocoa = target.clickPoint {
+            clickAt(cocoaPoint: cocoa)
+            usleep(40_000)  // ~40ms for the app to focus the field before typing
+            NSLog("SonarDictate: broadcast -> click \(Int(cocoa.x)),\(Int(cocoa.y)) + type \(text.count) chars to '\(target.label)'")
         } else {
-            NSLog("SonarDictate: AX value-set rejected (err=\(err.rawValue)) — focus+inject fallback (Electron-style field)")
-            AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            inject(text)
+            AXUIElementSetAttributeValue(target.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            usleep(40_000)
+            NSLog("SonarDictate: broadcast -> AX-focus + type \(text.count) chars to '\(target.label)'")
         }
+        inject(text)
+        usleep(30_000)  // settle before moving on to the next target
+    }
+
+    // Synthesize a left mouse click at a Cocoa-coordinate screen point (flip to
+    // Quartz top-left for CGEvent). Used to focus a broadcast target's real input.
+    private func clickAt(cocoaPoint cocoa: CGPoint) {
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? cocoa.y
+        let quartz = CGPoint(x: cocoa.x, y: primaryHeight - cocoa.y)
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: quartz, mouseButton: .left)
+        let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: quartz, mouseButton: .left)
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
     }
 
     // Asks the Accessibility API whether the system-wide focused element is an
@@ -773,6 +866,15 @@ if !cliArgs.isEmpty {
     runCLI(cliArgs)
 }
 
+// Mirror stderr (where NSLog also writes) to a readable plaintext log. The
+// unified log redacts our interpolated NSLog messages as <private>, so
+// `log show` is useless for our own diagnostics; redirecting fd 2 to
+// ~/Library/Logs/SonarDictate.log captures every NSLog verbatim with zero
+// per-call changes — the idiomatic macOS app log location, greppable by us.
+let logPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SonarDictate.log")
+freopen(logPath, "a", stderr)
+NSLog("SonarDictate: --- launch \(ISO8601DateFormatter().string(from: Date())) ---")
+
 // No args → background dictation mode.
 let store: SecureStore
 let workflows: WorkflowStore
@@ -791,9 +893,11 @@ if #available(macOS 26.0, *) {
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
     let overlay = RecordingOverlay()
     let chip = TextChip()
+    let highlighter = FieldHighlighter()
     dictator.statusItem = statusItem
     dictator.overlay = overlay
     dictator.chip = chip
+    dictator.highlighter = highlighter
     dictator.bootstrap()
     NSApplication.shared.run()
 } else {

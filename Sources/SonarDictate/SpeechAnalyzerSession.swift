@@ -33,9 +33,14 @@ final class SpeechAnalyzerSession {
     private var converter: AVAudioConverter?
     private var analyzerFormat: AVAudioFormat?
 
-    // Range-keyed transcript chunks (CMTime seconds rounded to ms as key) so
-    // volatile revisions of the same range start replace cleanly.
-    private var chunks: [Double: String] = [:]
+    // Final (committed) transcript segments, keyed by range start (ms). Volatile
+    // (in-progress) results are tracked SEPARATELY: mixing volatile + final in
+    // one map doubled every phrase, because a volatile and its final can have
+    // range starts that jitter by ~1ms → different keys → both survive. Finals
+    // accumulate; only the latest volatile tail is kept and it never enters the
+    // committed transcript.
+    private var finalizedChunks: [Double: String] = [:]
+    private var volatileText: String = ""
     private let chunksQueue = DispatchQueue(label: "sonar-dictate.speech.chunks")
 
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
@@ -54,6 +59,27 @@ final class SpeechAnalyzerSession {
     // only AFTER this returns, so no buffer reaches append() before the
     // converter exists.
     func start(inputFormat: AVAudioFormat) async throws {
+        // Tear down any prior run BEFORE building a new one. If a previous
+        // session's start() raced with a fast stop (e.g. a <2s Option tap while
+        // start() was still negotiating the audio format), its input continuation
+        // was never finished and its analyzer/results tasks hang forever. Two
+        // overlapping SpeechAnalyzer instances corrupt the pipeline so the new
+        // session never emits a final result — which kills finalize()/broadcast.
+        // Cancelling here guarantees exactly one analyzer at a time.
+        audioContinuation?.finish()
+        audioContinuation = nil
+        resultsTask?.cancel()
+        analyzerTask?.cancel()
+        resultsTask = nil
+        analyzerTask = nil
+        analyzer = nil
+        self.transcriber = nil
+
+        // .progressiveTranscription bundles the transcription options that drive
+        // smooth streaming volatile partials — this is the lowest-latency LIVE
+        // cadence available. (Tried explicit reportingOptions [.volatileResults,
+        // .fastResults] to go faster; it actually regressed — dropping the preset
+        // lost progressive streaming and the output got chunkier. The preset wins.)
         let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
         self.transcriber = transcriber
 
@@ -75,7 +101,7 @@ final class SpeechAnalyzerSession {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
 
-        chunksQueue.sync { self.chunks.removeAll() }
+        chunksQueue.sync { self.finalizedChunks.removeAll(); self.volatileText = "" }
 
         resultsTask = Task { [weak self] in
             guard let self else { return }
@@ -118,9 +144,25 @@ final class SpeechAnalyzerSession {
     }
 
     func stop() {
+        // 1. Signal no-more-audio by finishing the input stream.
         audioContinuation?.finish()
         audioContinuation = nil
-        // Let resultsTask drain so the user's last words come through.
+        // 2. Explicitly finalize the analyzer. THIS is load-bearing: finishing
+        //    the input stream alone does NOT complete transcriber.results, so the
+        //    resultsTask loop never ends and its final emitTranscript(isFinal:true)
+        //    never runs — which is why commit-at-end wrote nothing. finalizeAnd
+        //    FinishThroughEndOfInput() flushes pending audio + promotes volatile
+        //    results to final, completing the stream so the final transcript fires.
+        let analyzer = self.analyzer
+        Task {
+            do {
+                try await analyzer?.finalizeAndFinishThroughEndOfInput()
+            } catch is CancellationError {
+                // normal if a newer session superseded this one
+            } catch {
+                NSLog("SonarDictate: analyzer finalize error: \(error)")
+            }
+        }
     }
 
     // MARK: - Internals
@@ -155,14 +197,31 @@ final class SpeechAnalyzerSession {
     private func handle(result: SpeechTranscriber.Result) {
         let plain = String(result.text.characters)
         let key = result.range.start.seconds.rounded(toMilliseconds: 3)
-        chunksQueue.sync { self.chunks[key] = plain }
+        chunksQueue.sync {
+            if result.isFinal {
+                // Committed segment: store under its range and drop the volatile
+                // tail it supersedes — otherwise the in-progress copy doubles it.
+                self.finalizedChunks[key] = plain
+                self.volatileText = ""
+            } else {
+                // Only the latest volatile matters. Each volatile result's text is
+                // the full guess for its (un-finalized) range, so replace — never
+                // append — the previous volatile.
+                self.volatileText = plain
+            }
+        }
         emitTranscript(isFinal: false)
     }
 
     private func emitTranscript(isFinal: Bool) {
-        let snapshot: [Double: String] = chunksQueue.sync { self.chunks }
-        let assembled = snapshot.keys.sorted()
-            .compactMap { snapshot[$0] }
+        let (finals, vol): ([Double: String], String) = chunksQueue.sync {
+            (self.finalizedChunks, self.volatileText)
+        }
+        var parts = finals.keys.sorted().compactMap { finals[$0] }
+        // Live tail (volatile) is shown only for partial/overlay updates. The
+        // committed transcript (isFinal) is finals-only, so nothing doubles.
+        if !isFinal, !vol.isEmpty { parts.append(vol) }
+        let assembled = parts
             .joined(separator: " ")
             .replacingOccurrences(of: "  ", with: " ")
         onTranscriptUpdate?(assembled, isFinal)

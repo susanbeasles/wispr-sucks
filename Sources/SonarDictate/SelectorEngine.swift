@@ -17,6 +17,12 @@ final class SelectorEngine {
         let element: AXUIElement
         let appName: String
         let label: String
+        // The exact screen point (Cocoa, bottom-left) the user clicked to add
+        // this target. This is the RELIABLE focus anchor: the captured AX
+        // element is flaky in Electron/web apps (returns toolbar junk), but the
+        // click point is, by definition, on the real input. nil for ⌃⌥L adds
+        // (focused element, no click). Broadcast clicks here to focus, then types.
+        let clickPoint: CGPoint?
     }
 
     private(set) var targets: [Target] = []
@@ -44,7 +50,7 @@ final class SelectorEngine {
         var elementRef: AXUIElement?
         let err = AXUIElementCopyElementAtPosition(system, Float(quartz.x), Float(quartz.y), &elementRef)
         guard err == .success, let element = elementRef else { return nil }
-        return addIfEditable(element)
+        return addIfEditable(element, clickPoint: cocoa)
     }
 
     // Add the currently system-focused element (⌃⌥L gesture).
@@ -54,7 +60,7 @@ final class SelectorEngine {
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
               let focused else { return nil }
-        return addIfEditable(focused as! AXUIElement)
+        return addIfEditable(focused as! AXUIElement, clickPoint: nil)
     }
 
     func removeLast() {
@@ -67,12 +73,23 @@ final class SelectorEngine {
 
     // MARK: - Internals
 
-    private func addIfEditable(_ element: AXUIElement) -> String? {
+    private func addIfEditable(_ element: AXUIElement, clickPoint: CGPoint?) -> String? {
         guard isEditable(element) else { return nil }
-        if targets.contains(where: { CFEqual($0.element, element) }) { return nil }   // dedup
+        // Dedup: click-adds by point proximity (two web inputs in the same app
+        // can return the SAME flaky AX element, so element-equality would wrongly
+        // collapse them — the click point is what distinguishes them); focus-adds
+        // by element identity.
+        if let cp = clickPoint {
+            if targets.contains(where: { t in
+                guard let ep = t.clickPoint else { return false }
+                return hypot(ep.x - cp.x, ep.y - cp.y) < 8
+            }) { return nil }
+        } else if targets.contains(where: { CFEqual($0.element, element) }) {
+            return nil
+        }
         let app = appName(of: element)
         let label = fieldLabel(of: element) ?? app
-        targets.append(Target(element: element, appName: app, label: label))
+        targets.append(Target(element: element, appName: app, label: label, clickPoint: clickPoint))
         return label
     }
 
