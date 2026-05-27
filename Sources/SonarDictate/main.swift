@@ -64,10 +64,10 @@ final class Dictator {
     // Double-space commit detection: timestamp of the last space keyDown.
     private var lastSpaceDown: TimeInterval = 0
 
-    // Locked target field (AX reference). When set, dictation writes here
-    // regardless of current focus — flip to another Space and keep talking.
-    // v1 = single field; multi-field broadcast ("talk to 5 agents") is v2.
-    private var lockedField: AXUIElement?
+    // Selector engine — the set of target fields a dictation broadcasts to.
+    // Built up by clicking fields while ⌥ is held (or ⌃⌥L for the focused
+    // field). Persists until wiped. On release, the transcript writes to all.
+    private let selector = SelectorEngine()
 
     // Optional on-device Foundation Models cleanup pass (opt-in per app).
     private let cleanup = Cleanup()
@@ -141,11 +141,27 @@ final class Dictator {
         NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return }
 
-            // ⌃⌥L → toggle lock on the currently focused field.
-            if event.keyCode == 37,  // 37 = kVK_ANSI_L
-               event.modifierFlags.contains(.control),
-               event.modifierFlags.contains(.option) {
-                self.toggleFieldLock()
+            let ctrlOpt = event.modifierFlags.contains(.control) && event.modifierFlags.contains(.option)
+
+            // ⌃⌥L → add the focused field to the selector.
+            if ctrlOpt, event.keyCode == 37 {  // 37 = kVK_ANSI_L
+                if let label = self.selector.addFocused() {
+                    NSLog("SonarDictate: + target '\(label)' (selector now \(self.selector.count))")
+                } else {
+                    NSLog("SonarDictate: ⌃⌥L — focused element not editable / already in set")
+                }
+                return
+            }
+            // ⌃⌥K → wipe the selector.
+            if ctrlOpt, event.keyCode == 40 {  // 40 = kVK_ANSI_K
+                self.selector.wipe()
+                NSLog("SonarDictate: selector WIPED")
+                return
+            }
+            // ⌃⌥⌫ → remove the last target.
+            if ctrlOpt, event.keyCode == 51 {  // 51 = kVK_Delete
+                self.selector.removeLast()
+                NSLog("SonarDictate: removed last target (selector now \(self.selector.count))")
                 return
             }
 
@@ -159,6 +175,17 @@ final class Dictator {
                 self.commitChip()
             } else {
                 self.lastSpaceDown = now
+            }
+        }
+
+        // Click-to-target: while ⌥ is held (dictating), a click adds the
+        // editable field under the pointer to the selector. Observed via a
+        // global mouse-down monitor; the click still does its normal thing in
+        // the target app — we just also capture the field.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            guard let self, self.isOptionDown else { return }
+            if let label = self.selector.addElement(atCocoaPoint: NSEvent.mouseLocation) {
+                NSLog("SonarDictate: + target '\(label)' via click (selector now \(self.selector.count))")
             }
         }
 
@@ -463,12 +490,15 @@ final class Dictator {
     }
 
     // Routing priority:
-    //   1. A locked field is set → write there regardless of current focus.
+    //   1. Selector has targets → broadcast to ALL of them.
     //   2. An editable field is focused → direct inject ("shoot for the stars").
     //   3. Otherwise → park in the draggable chip.
     private func commit(_ text: String) {
-        if let locked = lockedField {
-            writeToLocked(locked, text: text)
+        if !selector.isEmpty {
+            NSLog("SonarDictate: broadcasting \(text.count) chars to \(selector.count) target(s): \(selector.summary)")
+            for target in selector.targets {
+                writeToLocked(target.element, text: text)
+            }
             return
         }
         if isEditableFieldFocused() {
@@ -478,27 +508,6 @@ final class Dictator {
             NSLog("SonarDictate: no editable field focused -> chip")
             chip?.present(text)
         }
-    }
-
-    // Toggle the locked target field. Lock = capture the system-wide focused
-    // element; future dictation writes there until unlocked. ⌃⌥L.
-    private func toggleFieldLock() {
-        if lockedField != nil {
-            lockedField = nil
-            NSLog("SonarDictate: field lock CLEARED")
-            DispatchQueue.main.async { self.statusItem?.refreshCounts() }
-            return
-        }
-        let system = AXUIElementCreateSystemWide()
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let focused else {
-            NSLog("SonarDictate: ⌃⌥L pressed but no focused element to lock")
-            return
-        }
-        lockedField = (focused as! AXUIElement)
-        NSLog("SonarDictate: field LOCKED — dictation now writes here regardless of focus")
-        DispatchQueue.main.async { self.statusItem?.refreshCounts() }
     }
 
     // Write to the locked field. Tries non-disruptive AX value-set first
