@@ -64,6 +64,11 @@ final class Dictator {
     // Double-space commit detection: timestamp of the last space keyDown.
     private var lastSpaceDown: TimeInterval = 0
 
+    // Locked target field (AX reference). When set, dictation writes here
+    // regardless of current focus — flip to another Space and keep talking.
+    // v1 = single field; multi-field broadcast ("talk to 5 agents") is v2.
+    private var lockedField: AXUIElement?
+
     // Optional on-device Foundation Models cleanup pass (opt-in per app).
     private let cleanup = Cleanup()
     private var sessionNeedsCleanup = false
@@ -135,6 +140,17 @@ final class Dictator {
         // any other keystroke; this watches the space keycode only.
         NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return }
+
+            // ⌃⌥L → toggle lock on the currently focused field.
+            if event.keyCode == 37,  // 37 = kVK_ANSI_L
+               event.modifierFlags.contains(.control),
+               event.modifierFlags.contains(.option) {
+                self.toggleFieldLock()
+                return
+            }
+
+            // Double-space → commit the chip into the focused field (only
+            // when a chip is actually showing; otherwise normal typing).
             guard event.keyCode == 49 else { return }   // 49 = kVK_Space
             guard self.chip?.isShowing == true else { return }
             let now = ProcessInfo.processInfo.systemUptime
@@ -446,15 +462,62 @@ final class Dictator {
         }
     }
 
-    // Direct-inject if an editable field is focused ("shoot for the stars");
-    // otherwise park the text in the draggable chip.
+    // Routing priority:
+    //   1. A locked field is set → write there regardless of current focus.
+    //   2. An editable field is focused → direct inject ("shoot for the stars").
+    //   3. Otherwise → park in the draggable chip.
     private func commit(_ text: String) {
+        if let locked = lockedField {
+            writeToLocked(locked, text: text)
+            return
+        }
         if isEditableFieldFocused() {
             NSLog("SonarDictate: editable field focused -> direct inject")
             inject(text)
         } else {
             NSLog("SonarDictate: no editable field focused -> chip")
             chip?.present(text)
+        }
+    }
+
+    // Toggle the locked target field. Lock = capture the system-wide focused
+    // element; future dictation writes there until unlocked. ⌃⌥L.
+    private func toggleFieldLock() {
+        if lockedField != nil {
+            lockedField = nil
+            NSLog("SonarDictate: field lock CLEARED")
+            DispatchQueue.main.async { self.statusItem?.refreshCounts() }
+            return
+        }
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused else {
+            NSLog("SonarDictate: ⌃⌥L pressed but no focused element to lock")
+            return
+        }
+        lockedField = (focused as! AXUIElement)
+        NSLog("SonarDictate: field LOCKED — dictation now writes here regardless of focus")
+        DispatchQueue.main.async { self.statusItem?.refreshCounts() }
+    }
+
+    // Write to the locked field. Tries non-disruptive AX value-set first
+    // (appends to existing content); falls back to focus+keystroke-inject if
+    // that's rejected (web/Electron). Logs which path won so we learn whether
+    // the clean multi-broadcast is viable on the user's agent apps.
+    private func writeToLocked(_ element: AXUIElement, text: String) {
+        var currentRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &currentRef)
+        let current = (currentRef as? String) ?? ""
+        let combined = current.isEmpty ? text : current + " " + text
+
+        let err = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, combined as CFTypeRef)
+        if err == .success {
+            NSLog("SonarDictate: wrote \(text.count) chars to locked field via AX value-set (clean, no focus steal)")
+        } else {
+            NSLog("SonarDictate: AX value-set rejected (err=\(err.rawValue)) — focus+inject fallback (Electron-style field)")
+            AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            inject(text)
         }
     }
 
