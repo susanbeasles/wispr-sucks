@@ -34,7 +34,8 @@ enum SessionMode: String {
 final class Dictator {
     private let session = SpeechAnalyzerSession(locale: Locale(identifier: "en-US"))
     private let engine = AVAudioEngine()
-    private var isOptionDown = false
+    // True while the fn/globe key is held. The dictation talk-key (was Option).
+    private var isFnDown = false
     private var emittedText = ""
 
     // Per-session injection mode (see SessionMode above)
@@ -149,18 +150,25 @@ final class Dictator {
     }
 
     private func installMonitor() {
+        // Talk key is the FN/globe key. The .function modifier flag fires
+        // flagsChanged when the fn key itself is held/released - arrow keys and
+        // F-keys also set the .function flag in their event modifierFlags but
+        // they're keyDown events, not flagsChanged, so they don't trigger this
+        // monitor. (System Settings -> Keyboard -> "Press  key to" should be set
+        // to "Do nothing" so macOS doesn't fight us - emoji picker / system
+        // Dictation can intercept otherwise.)
         NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
             guard let self else { return }
-            let nowDown = event.modifierFlags.contains(.option)
-            if nowDown && !self.isOptionDown {
-                self.isOptionDown = true
-                NSLog("SonarDictate: Option DOWN — startListening")
+            let nowDown = event.modifierFlags.contains(.function)
+            if nowDown && !self.isFnDown {
+                self.isFnDown = true
+                NSLog("SonarDictate: fn DOWN - startListening")
                 self.statusItem?.setListening(true)
                 self.overlay?.show()
                 self.startListening()
-            } else if !nowDown && self.isOptionDown {
-                self.isOptionDown = false
-                NSLog("SonarDictate: Option UP — stopListening")
+            } else if !nowDown && self.isFnDown {
+                self.isFnDown = false
+                NSLog("SonarDictate: fn UP - stopListening")
                 self.statusItem?.setListening(false)
                 self.overlay?.hide()
                 self.stopListening()
@@ -223,19 +231,24 @@ final class Dictator {
             }
         }
 
-        // Click-to-target: while ⌥ is held (dictating), a click adds the
-        // editable field under the pointer to the selector. Observed via a
-        // global mouse-down monitor; the click still does its normal thing in
-        // the target app — we just also capture the field.
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            guard let self, self.isOptionDown else { return }
+        // Click-to-target: requires the EXPLICIT chord  + fn + click. The
+        // fn-alone+click of the previous build was too easy to fire by accident
+        // - a stray click while dictating silently added a phantom target, and
+        // the next release would broadcast the text to it AND the focused field,
+        // producing two near-back-to-back injects that interleaved into a mess.
+        // Per the step-4 spec the explicit chord is the real gesture; bringing
+        // it forward now stops the accidental-add bug.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self, self.isFnDown else { return }
+            let flags = event.modifierFlags
+            guard flags.contains(.control), flags.contains(.command) else { return }
             if let label = self.selector.addElement(atCocoaPoint: NSEvent.mouseLocation) {
-                NSLog("SonarDictate: + target '\(label)' via click (selector now \(self.selector.count))")
+                NSLog("SonarDictate: + target '\(label)' via +fn+click (selector now \(self.selector.count))")
                 self.highlighter?.update(targets: self.selector.targets)
             }
         }
 
-        NSLog("SonarDictate: Ready. Hold Option to talk, release to capture. Double-space to drop the chip into a field.")
+        NSLog("SonarDictate: Ready. Hold fn/ to talk, release to capture. Double-space to drop the chip into a field.")
     }
 
     // Commit the chip's pending text into the currently focused field, then

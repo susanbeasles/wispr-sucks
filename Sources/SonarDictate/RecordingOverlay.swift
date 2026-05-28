@@ -70,7 +70,18 @@ final class RecordingOverlay {
     }
 
     func updateTranscript(_ text: String) {
-        DispatchQueue.main.async { self.transcriptLabel?.stringValue = text }
+        DispatchQueue.main.async {
+            // Soft crossfade between revisions so word-swaps ("by lateral" ->
+            // "bilateral") morph instead of snapping. ~80ms is short enough to
+            // feel snappy but long enough to register as smooth.
+            if let layer = self.transcriptLabel?.layer {
+                let t = CATransition()
+                t.type = .fade
+                t.duration = 0.08
+                layer.add(t, forKey: kCATransition)
+            }
+            self.transcriptLabel?.stringValue = text
+        }
     }
 
     func setBufferingMode(_ buffering: Bool) {
@@ -109,7 +120,7 @@ final class RecordingOverlay {
         icon?.frame = NSRect(x: 14, y: (size.height - 24) / 2, width: 24, height: 24)
         statusLabel?.frame = NSRect(x: 46, y: 30, width: 110, height: 16)
         statusLabel?.isHidden = false
-        transcriptLabel?.frame = NSRect(x: 46, y: 8, width: size.width - 60, height: 22)
+        transcriptLabel?.frame = NSRect(x: 46, y: 6, width: size.width - 60, height: 24)
         transcriptLabel?.isHidden = false
         w.alphaValue = 1.0
         savePosition()
@@ -200,11 +211,16 @@ final class RecordingOverlay {
         lbl.isBordered = false
         lbl.drawsBackground = false
         lbl.textColor = .labelColor
-        lbl.font = .systemFont(ofSize: 14, weight: .medium)
+        lbl.font = .systemFont(ofSize: 17, weight: .medium)
+        // Right-align + truncate-head: the latest words always sit at the SAME
+        // right-edge anchor instead of pushing the existing line leftward as
+        // new words arrive. Kills the visual "jolt" of revisions.
+        lbl.alignment = .right
         lbl.maximumNumberOfLines = 1
-        lbl.lineBreakMode = .byTruncatingHead   // keep the latest words visible
+        lbl.lineBreakMode = .byTruncatingHead
         lbl.stringValue = ""
         lbl.isHidden = true
+        lbl.wantsLayer = true   // so we can attach the fade CATransition
         background.addSubview(lbl)
         transcriptLabel = lbl
 
