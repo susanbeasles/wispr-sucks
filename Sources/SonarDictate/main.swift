@@ -58,6 +58,7 @@ final class Dictator {
     private let store: SecureStore
     private let workflows: WorkflowStore
     private let rag: RAGIndex
+    private let dictionary: DictionaryStore
     private var audioFrames: [AVAudioPCMBuffer] = []
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
@@ -83,6 +84,12 @@ final class Dictator {
     // Double-space commit detection: timestamp of the last space keyDown.
     private var lastSpaceDown: TimeInterval = 0
 
+    // Clipboard stash for the chip's "click to copy, paste anywhere, clipboard
+    // unharmed" flow: clicking the chip saves the user's current clipboard, puts
+    // the chip text on it, and after their next V we put the original back.
+    private var clipboardStash: [[String: Data]]?
+    private var stashChangeCount: Int = -1
+
     // Selector engine — the set of target fields a dictation broadcasts to.
     // Built up by clicking fields while ⌥ is held (or ⌃⌥L for the focused
     // field). Persists until wiped. On release, the transcript writes to all.
@@ -92,10 +99,11 @@ final class Dictator {
     private let cleanup = Cleanup()
     private var sessionNeedsCleanup = false
 
-    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex) {
+    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore) {
         self.store = store
         self.workflows = workflows
         self.rag = rag
+        self.dictionary = dictionary
     }
 
     func bootstrap() {
@@ -111,6 +119,12 @@ final class Dictator {
         }
         session.onError = { error in
             NSLog("SonarDictate: speech session error: \(error)")
+        }
+
+        // Chip click -> copy its text to the clipboard (stashing the original so
+        // we can restore it after the user's next paste).
+        chip?.onCopy = { [weak self] text in
+            self?.copyChipToClipboard(text)
         }
 
         // Explicit Accessibility trust check. Without this, addGlobalMonitorForEvents
@@ -159,6 +173,15 @@ final class Dictator {
         // any other keystroke; this watches the space keycode only.
         NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return }
+
+            // V while a clipboard restore is armed -> let the paste land, then
+            // put the user's original clipboard back. (A global monitor can't
+            // consume the event, so the paste itself proceeds normally.)
+            if event.keyCode == 9, event.modifierFlags.contains(.command), self.clipboardStash != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    self?.restoreClipboardIfPending()
+                }
+            }
 
             let ctrlOpt = event.modifierFlags.contains(.control) && event.modifierFlags.contains(.option)
 
@@ -227,6 +250,51 @@ final class Dictator {
         chip?.hide()
     }
 
+    // Chip clicked -> copy its text to the clipboard, stashing whatever was there
+    // so we can hand it back after the user pastes. Then dismiss the chip. This
+    // is what frees the captured words from the chip when no field was focused.
+    private func copyChipToClipboard(_ text: String) {
+        let pb = NSPasteboard.general
+        clipboardStash = Self.snapshotPasteboard(pb)
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        stashChangeCount = pb.changeCount
+        NSLog("SonarDictate: chip -> clipboard (\(text.count) chars); original stashed, armed for restore-on-paste")
+        chip?.hide()
+    }
+
+    // Capture every item+type currently on the pasteboard so we can restore an
+    // image/files/RTF clipboard, not just plain text.
+    private static func snapshotPasteboard(_ pb: NSPasteboard) -> [[String: Data]] {
+        (pb.pasteboardItems ?? []).map { item in
+            var dict: [String: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) { dict[type.rawValue] = data }
+            }
+            return dict
+        }
+    }
+
+    // Put the user's original clipboard back - but only if OUR text is still on
+    // it (if they copied something new in between, leave their new copy alone).
+    private func restoreClipboardIfPending() {
+        guard let stash = clipboardStash else { return }
+        let pb = NSPasteboard.general
+        defer { clipboardStash = nil; stashChangeCount = -1 }
+        guard pb.changeCount == stashChangeCount else {
+            NSLog("SonarDictate: clipboard changed since copy - leaving the user's newer copy intact")
+            return
+        }
+        pb.clearContents()
+        let items = stash.map { dict -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in dict { item.setData(data, forType: NSPasteboard.PasteboardType(type)) }
+            return item
+        }
+        if !items.isEmpty { pb.writeObjects(items) }
+        NSLog("SonarDictate: clipboard restored after paste")
+    }
+
     private func startListening() {
         listening = true
         emittedText = ""
@@ -245,28 +313,33 @@ final class Dictator {
             NSLog("SonarDictate: cleanup mode ON for \(sessionAppContext ?? "?") — buffering, will clean on finalize")
         }
 
-        // Decide live-typing vs commit-at-end NOW (we know focus + selector state).
-        // Stream into a single focused field for the real-time "typing as I talk"
-        // feel; otherwise buffer and route on release (broadcast to N targets, or
-        // park in the chip, or clean-then-inject).
-        streamingIntoField = selector.isEmpty && !sessionNeedsCleanup && isEditableFieldFocused()
-        NSLog("SonarDictate: mode = \(streamingIntoField ? "STREAM into focused field" : (selector.isEmpty ? "commit-at-end (chip/inject)" : "broadcast \(selector.count) target(s)"))")
+        // NEW MODEL: never live-type into the user's real field. That was the
+        // source of the mid-sentence injection garble AND the held input focus -
+        // we were firing keystrokes into a foreign app on every volatile revision.
+        // Instead the live words stream into our OWN floating widget (zero-lag
+        // feel, fully under our control), and the real field gets the text exactly
+        // once, on release. So everything commits at end now.
+        streamingIntoField = false
+        NSLog("SonarDictate: mode = commit-at-end (live preview in floating widget; \(selector.isEmpty ? "inject/chip" : "broadcast \(selector.count)") on release)")
 
         // Seed the recognizer with vocabulary biased toward what this user has
         // said recently in this app context. SpeechAnalyzer's AnalysisContext
         // takes a tagged-string map; we feed it via session.setContextualStrings().
+        // Bias the recognizer toward the user's own vocabulary. The DICTIONARY
+        // comes first (curated + corrections — the signal that actually teaches
+        // the right words), then RAG over past transcripts (useful, but half-blind:
+        // it'll reinforce whatever it heard, errors included). Dedup, cap, feed.
+        var bias = dictionary.terms(forContext: sessionAppContext, limit: 100)
         if rag.assetsReady, rag.count > 0 {
-            do {
-                let bias = try rag.vocabularyBias(forContext: sessionAppContext, k: 8)
-                session.setContextualStrings(bias)
-                if !bias.isEmpty {
-                    NSLog("SonarDictate: biased recognizer with \(bias.count) terms from RAG")
-                }
-            } catch {
-                NSLog("SonarDictate: RAG bias skipped: \(error)")
+            if let ragBias = try? rag.vocabularyBias(forContext: sessionAppContext, k: 8) {
+                bias += ragBias
             }
-        } else {
-            session.setContextualStrings([])  // clear stale bias from previous session
+        }
+        var seen = Set<String>()
+        let merged = bias.filter { seen.insert($0.lowercased()).inserted }
+        session.setContextualStrings(Array(merged.prefix(200)))
+        if !merged.isEmpty {
+            NSLog("SonarDictate: biased recognizer with \(merged.count) terms (\(dictionary.count) in dictionary)")
         }
 
         let format = engine.inputNode.outputFormat(forBus: 0)
@@ -419,7 +492,13 @@ final class Dictator {
                 }
             }
         default:
-            NSLog("SonarDictate: action \(action) — handler not implemented yet")
+            // Trigger handlers (yo/claude/note/todo/llmPrompt) aren't wired yet.
+            // Don't EAT the user's text just because their first word happened to
+            // match a built-in trigger - fall back to plain dictation so the
+            // transcript still lands. Workflow bindings (above) are explicit and
+            // still fire normally.
+            NSLog("SonarDictate: action \(action) - no handler; falling back to dictation")
+            commitDictation(transcript)
         }
 
         persistSession(transcript: transcript)
@@ -535,28 +614,34 @@ final class Dictator {
 
     // MARK: - Streaming injection
 
+    // Reconcile the focused field to `target` with the MINIMAL edit: keep the
+    // common prefix, backspace only the diverging tail of what we already typed,
+    // then type only the new tail.
+    //
+    // The old version backspaced + retyped the ENTIRE string on any divergence.
+    // On long, continuously-revised dictation that was a storm of keystrokes that
+    // raced the system's async event delivery and produced garbled, interleaved
+    // text that felt unstoppable. A volatile revision usually only changes the
+    // last word or two, so a common-prefix diff keeps each update tiny - no storm,
+    // and the final reconciliation on release is small, so it "lets go" fast.
     private func streamEmit(target: String, isFinal: Bool) {
-        if target.hasPrefix(emittedText) {
-            let delta = String(target.dropFirst(emittedText.count))
-            if !delta.isEmpty {
-                inject(delta)
-                emittedText = target
-            }
-        } else if emittedText.hasPrefix(target) {
-            backspace(count: emittedText.count - target.count)
-            emittedText = target
-        } else {
-            backspace(count: emittedText.count)
-            inject(target)
-            emittedText = target
-        }
+        guard target != emittedText else { return }
+        let common = emittedText.commonPrefix(with: target).count
+        let toDelete = emittedText.count - common
+        if toDelete > 0 { backspace(count: toDelete) }
+        let suffix = String(target.dropFirst(common))
+        if !suffix.isEmpty { inject(suffix) }
+        emittedText = target
     }
 
     // Commit a finalized plain-dictation transcript. Runs the optional cleanup
     // pass first (per-app), then routes to direct-inject or the chip.
     private func commitDictation(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            NSLog("SonarDictate: empty transcript - nothing to commit (short hold or no speech detected)")
+            return
+        }
         if sessionNeedsCleanup {
             Task { [weak self] in
                 guard let self else { return }
@@ -697,10 +782,12 @@ func runCLI(_ args: [String]) -> Never {
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex
+    let dictionary: DictionaryStore
     do {
         store = try SecureStore()
         workflows = try WorkflowStore()
         rag = try RAGIndex()
+        dictionary = try DictionaryStore()
     } catch {
         fputs("error: \(error)\n", stderr)
         exit(1)
@@ -824,6 +911,47 @@ func runCLI(_ args: [String]) -> Never {
             try rag.reset()
             print("RAG index cleared. Recordings retained; future dictations will rebuild the index.")
 
+        // Personal dictionary — the learning substrate. Terms here bias the
+        // recognizer toward the user's own vocabulary every session.
+        case "dict":
+            let sub = rest.first
+            switch sub {
+            case nil, "list":
+                let items = dictionary.list()
+                if items.isEmpty {
+                    print("(dictionary empty)")
+                    print("\nadd terms with: sonar-dictate dict add \"<term or phrase>\"")
+                } else {
+                    for e in items {
+                        let ctx = e.appContext.map { " · \($0)" } ?? ""
+                        print(String(format: "%6.1f  ", e.weight) + "\(e.term)  [\(e.source)\(ctx)]")
+                    }
+                    print("\n(\(items.count) terms)")
+                }
+            case "add":
+                let term = rest.dropFirst().joined(separator: " ")
+                guard !term.isEmpty else {
+                    fputs("usage: sonar-dictate dict add \"<term or phrase>\"\n", stderr)
+                    exit(2)
+                }
+                dictionary.add(term, weight: 2, source: .manual)
+                print("added \"\(term)\" (\(dictionary.count) terms total)")
+            case "rm", "remove":
+                let term = rest.dropFirst().joined(separator: " ")
+                guard !term.isEmpty else {
+                    fputs("usage: sonar-dictate dict rm \"<term>\"\n", stderr)
+                    exit(2)
+                }
+                print(dictionary.remove(term) ? "removed \"\(term)\"" : "\"\(term)\" not in dictionary")
+            case "reset", "wipe":
+                dictionary.wipe()
+                print("dictionary wiped.")
+            default:
+                fputs("unknown dict subcommand: \(sub ?? "")\n", stderr)
+                fputs("usage: sonar-dictate dict [list | add \"<term>\" | rm \"<term>\" | reset]\n", stderr)
+                exit(2)
+            }
+
         case "help", "-h", "--help":
             print("""
             usage:  sonar-dictate <command> [args...]
@@ -844,6 +972,12 @@ func runCLI(_ args: [String]) -> Never {
               rag                           index stats + embedding model status
               similar <text...>             top-5 past recordings by cosine similarity
               rag-reset                     drop the index (recordings stay; reindex next session)
+
+            dictionary (personalization — biases the recognizer to your words):
+              dict                          list dictionary terms by weight
+              dict add "<term>"             add/reinforce a term
+              dict rm "<term>"              remove a term
+              dict reset                    wipe the dictionary
 
             (no args)  launch background dictation app
             """)
@@ -879,17 +1013,19 @@ NSLog("SonarDictate: --- launch \(ISO8601DateFormatter().string(from: Date())) -
 let store: SecureStore
 let workflows: WorkflowStore
 let rag: RAGIndex
+let dictionary: DictionaryStore
 do {
     store = try SecureStore()
     workflows = try WorkflowStore()
     rag = try RAGIndex()
+    dictionary = try DictionaryStore()
 } catch {
     NSLog("SonarDictate: failed to init stores: \(error)")
     exit(1)
 }
 
 if #available(macOS 26.0, *) {
-    let dictator = Dictator(store: store, workflows: workflows, rag: rag)
+    let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary)
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
     let overlay = RecordingOverlay()
     let chip = TextChip()
@@ -898,6 +1034,10 @@ if #available(macOS 26.0, *) {
     dictator.overlay = overlay
     dictator.chip = chip
     dictator.highlighter = highlighter
+    // The widget is always-on - install it now so the user can position it
+    // before the first dictation. It morphs between idle (small icon) and
+    // listening (expanded with live transcript) as sessions come and go.
+    overlay.install()
     dictator.bootstrap()
     NSApplication.shared.run()
 } else {

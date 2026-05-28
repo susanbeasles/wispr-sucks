@@ -16,7 +16,7 @@ import AppKit
 // Commit itself is driven by the Dictator (double-tap of the dictation key
 // while a field is focused). The chip is just the holding pen + visual.
 
-final class TextChip {
+final class TextChip: NSObject {
     private var window: DraggableChipWindow?
     private var label: NSTextField?
     private var countLabel: NSTextField?
@@ -24,13 +24,18 @@ final class TextChip {
     // The full captured text awaiting commit. nil when the chip is empty/hidden.
     private(set) var pendingText: String?
 
+    // Fired when the user clicks the chip. The Dictator copies the text to the
+    // clipboard (stashing whatever was there first) so the captured words aren't
+    // trapped in the chip with no way out when no field was focused.
+    var onCopy: ((String) -> Void)?
+
     func present(_ text: String) {
         DispatchQueue.main.async {
             self.pendingText = text
             self.ensureWindow()
             let preview = text.count > 60 ? String(text.prefix(57)) + "…" : text
             self.label?.stringValue = preview
-            self.countLabel?.stringValue = "\(text.count) chars · ⌥⌥ to insert"
+            self.countLabel?.stringValue = "\(text.count) chars - click to copy"
             self.window?.orderFront(nil)
         }
     }
@@ -103,12 +108,23 @@ final class TextChip {
 
         w.contentView = bg
 
+        // Click the chip -> copy. A click (no movement) fires the gesture; a drag
+        // still moves the window via isMovableByWindowBackground. Mouse events
+        // reach the view even though the window can't become key.
+        let click = NSClickGestureRecognizer(target: self, action: #selector(chipClicked))
+        bg.addGestureRecognizer(click)
+
         if let screen = NSScreen.main {
             let visible = screen.visibleFrame
             w.setFrameOrigin(NSPoint(x: visible.maxX - width - 24, y: visible.minY + 96))
         }
 
         window = w
+    }
+
+    @objc private func chipClicked() {
+        guard let text = pendingText else { return }
+        onCopy?(text)
     }
 }
 
