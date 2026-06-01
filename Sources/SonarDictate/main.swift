@@ -263,16 +263,21 @@ final class Dictator {
         chip?.hide()
     }
 
-    // Chip clicked -> copy its text to the clipboard, stashing whatever was there
-    // so we can hand it back after the user pastes. Then dismiss the chip. This
-    // is what frees the captured words from the chip when no field was focused.
+    // Chip clicked -> copy its text to the clipboard and hide the chip. We
+    // NO LONGER auto-restore the previous clipboard. The old restore-on-Cmd+V
+    // logic was destroying user data: when the paste failed to land (overlay,
+    // weird focus state, anything), the restore would still fire 250ms after
+    // the keystroke and wipe our text from the clipboard, making the dictation
+    // unrecoverable. There's no reliable signal from a Cmd+V that the paste
+    // actually landed (paste doesn't consume the clipboard), so the safe move
+    // is to leave the dictated text on the clipboard until the user copies
+    // something else themselves - normal macOS copy semantics, no surprises,
+    // no data loss.
     private func copyChipToClipboard(_ text: String) {
         let pb = NSPasteboard.general
-        clipboardStash = Self.snapshotPasteboard(pb)
         pb.clearContents()
         pb.setString(text, forType: .string)
-        stashChangeCount = pb.changeCount
-        NSLog("SonarDictate: chip -> clipboard (\(text.count) chars); original stashed, armed for restore-on-paste")
+        NSLog("SonarDictate: chip -> clipboard (\(text.count) chars); ready to paste, no auto-restore")
         chip?.hide()
     }
 
@@ -678,11 +683,18 @@ final class Dictator {
             }
             return
         }
-        if isEditableFieldFocused() {
-            NSLog("SonarDictate: editable field focused -> direct inject")
+        // Inject if Accessibility is trusted RIGHT NOW (live check, not the
+        // boot-time cached value) - CGEvent.post is silently dropped without it.
+        // If we don't have it, fall back to the chip so the user isn't stranded
+        // with text that has nowhere to go. The AX focus check is unreliable
+        // for Electron/web inputs (kAXFocusedUIElement often comes back nil
+        // even when the cursor is in the field), so it stays diagnostic-only.
+        _ = isEditableFieldFocused()
+        if AXIsProcessTrusted() {
+            NSLog("SonarDictate: commit \(text.count) chars via direct inject (AX trusted)")
             inject(text)
         } else {
-            NSLog("SonarDictate: no editable field focused -> chip")
+            NSLog("SonarDictate: AX not trusted - chip fallback (\(text.count) chars)")
             chip?.present(text)
         }
     }
@@ -722,30 +734,60 @@ final class Dictator {
     }
 
     // Asks the Accessibility API whether the system-wide focused element is an
-    // editable text control. Requires the Accessibility grant (which we already
-    // need for keystroke injection).
+    // editable text control. Logs the detected role/subrole every call so when
+    // an inject fails (text routes to chip instead of field), we can see what
+    // role the focused element actually reports - Electron/web apps use a wide
+    // range of non-standard roles and we need the data to extend our accept list.
     private func isEditableFieldFocused() -> Bool {
         let system = AXUIElementCreateSystemWide()
         var focused: CFTypeRef?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let focused else { return false }
+              let focused else {
+            NSLog("SonarDictate: AX focus check - no system-wide focused element")
+            return false
+        }
         let element = focused as! AXUIElement
 
         var roleRef: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
         let role = (roleRef as? String) ?? ""
+
+        var subroleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
+        let subrole = (subroleRef as? String) ?? ""
+
+        // Known editable roles. Expanded to cover web/Electron quirks beyond the
+        // three native Cocoa roles.
         let editableRoles: Set<String> = [
             kAXTextFieldRole as String,
             kAXTextAreaRole as String,
             kAXComboBoxRole as String,
+            "AXSearchField",
+            "AXTextRow",
         ]
-        if editableRoles.contains(role) { return true }
+        if editableRoles.contains(role) {
+            NSLog("SonarDictate: AX focus - role=\(role) (editable, native)")
+            return true
+        }
 
-        // Fallback for web/Electron inputs that report odd roles: treat as
-        // editable if the focused element's AXValue is settable.
+        // Electron/web inputs often report unusual roles but expose AXValue as
+        // settable. Accept those.
         var settable: DarwinBoolean = false
         AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
-        return settable.boolValue
+        if settable.boolValue {
+            NSLog("SonarDictate: AX focus - role=\(role) subrole=\(subrole) (AXValue settable, accepting)")
+            return true
+        }
+
+        // Loose fallback: anything with "Text" in its role name. Catches things
+        // like AXTextRow / AXTextGroup / custom roles in Electron apps.
+        if role.contains("Text") || subrole.contains("Text") {
+            NSLog("SonarDictate: AX focus - role=\(role) subrole=\(subrole) (role contains Text, accepting)")
+            return true
+        }
+
+        NSLog("SonarDictate: AX focus - role=\(role) subrole=\(subrole) settable=false (NOT editable -> chip)")
+        return false
     }
 
     private func inject(_ text: String) {

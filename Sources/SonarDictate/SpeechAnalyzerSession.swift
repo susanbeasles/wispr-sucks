@@ -23,7 +23,7 @@ final class SpeechAnalyzerSession {
     private let locale: Locale
     private let context = AnalysisContext()
 
-    private var transcriber: SpeechTranscriber?
+    private var transcriber: DictationTranscriber?
     private var analyzer: SpeechAnalyzer?
     private var audioContinuation: AsyncStream<AnalyzerInput>.Continuation?
     private var analyzerTask: Task<Void, Never>?
@@ -75,13 +75,40 @@ final class SpeechAnalyzerSession {
         analyzer = nil
         self.transcriber = nil
 
-        // .progressiveTranscription bundles the transcription options that drive
-        // smooth streaming volatile partials — this is the lowest-latency LIVE
-        // cadence available. (Tried explicit reportingOptions [.volatileResults,
-        // .fastResults] to go faster; it actually regressed — dropping the preset
-        // lost progressive streaming and the output got chunkier. The preset wins.)
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        // DictationTranscriber instead of SpeechTranscriber: Apple ships two
+        // recognizers in macOS 26. SpeechTranscriber is tuned for transcribing
+        // recorded audio (meetings, podcasts). DictationTranscriber is tuned
+        // for the exact use case we have - live voice into text input. The
+        // .progressiveLongDictation preset gives the streaming-with-volatile-
+        // partials cadence (same shape as SpeechTranscriber's .progressive-
+        // Transcription) so the live preview UX is unchanged.
+        let transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
         self.transcriber = transcriber
+
+        // Ensure the language model assets are installed for this locale. Without
+        // this, the transcriber initializes silently and runs through audio but
+        // emits ZERO results - captured WAVs persist, finalize fires, transcript
+        // is empty. This is the (load-bearing) one-time per-locale download; once
+        // .installed everything else stays on-device.
+        let assetStatus = await AssetInventory.status(forModules: [transcriber])
+        NSLog("SonarDictate: speech assets status=\(assetStatus) for \(locale.identifier)")
+        if assetStatus == .supported {
+            do {
+                if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    NSLog("SonarDictate: downloading speech model for \(locale.identifier)...")
+                    try await req.downloadAndInstall()
+                    NSLog("SonarDictate: speech model installed")
+                } else {
+                    NSLog("SonarDictate: assetInstallationRequest returned nil - no install path")
+                }
+            } catch {
+                NSLog("SonarDictate: asset install error: \(error.localizedDescription)")
+            }
+        } else if assetStatus == .unsupported {
+            NSLog("SonarDictate: speech assets UNSUPPORTED for \(locale.identifier) - transcription will be empty")
+        } else if assetStatus == .downloading {
+            NSLog("SonarDictate: speech model is already downloading - proceeding")
+        }
 
         // Negotiate the transcriber-compatible audio format and build the
         // converter from the mic format to it.
@@ -194,7 +221,7 @@ final class SpeechAnalyzerSession {
         return output.frameLength > 0 ? output : nil
     }
 
-    private func handle(result: SpeechTranscriber.Result) {
+    private func handle(result: DictationTranscriber.Result) {
         let plain = String(result.text.characters)
         let key = result.range.start.seconds.rounded(toMilliseconds: 3)
         chunksQueue.sync {
@@ -218,9 +245,12 @@ final class SpeechAnalyzerSession {
             (self.finalizedChunks, self.volatileText)
         }
         var parts = finals.keys.sorted().compactMap { finals[$0] }
-        // Live tail (volatile) is shown only for partial/overlay updates. The
-        // committed transcript (isFinal) is finals-only, so nothing doubles.
-        if !isFinal, !vol.isEmpty { parts.append(vol) }
+        // Always include the live volatile tail, including on the final emit.
+        // DictationTranscriber keeps the most recent phrase in volatile state
+        // until session-end - without including it here, the last thing the user
+        // said gets silently dropped. Since each final clears volatileText, no
+        // double-counting risk.
+        if !vol.isEmpty { parts.append(vol) }
         let assembled = parts
             .joined(separator: " ")
             .replacingOccurrences(of: "  ", with: " ")
