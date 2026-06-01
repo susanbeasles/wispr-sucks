@@ -60,6 +60,7 @@ final class Dictator {
     private let workflows: WorkflowStore
     private let rag: RAGIndex
     private let dictionary: DictionaryStore
+    private let database: RecordingDatabase
     private var audioFrames: [AVAudioPCMBuffer] = []
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
@@ -100,11 +101,12 @@ final class Dictator {
     private let cleanup = Cleanup()
     private var sessionNeedsCleanup = false
 
-    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore) {
+    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore, database: RecordingDatabase) {
         self.store = store
         self.workflows = workflows
         self.rag = rag
         self.dictionary = dictionary
+        self.database = database
     }
 
     func bootstrap() {
@@ -534,7 +536,7 @@ final class Dictator {
         audioFrames.removeAll()
 
         // Persist asynchronously so we don't block the recognition callback
-        DispatchQueue.global(qos: .utility).async { [store, rag] in
+        DispatchQueue.global(qos: .utility).async { [store, rag, database] in
             let createdAt = Date()
             let persistedID: String?
             if let format = format, !frames.isEmpty {
@@ -579,6 +581,34 @@ final class Dictator {
                 }
             } else if persistedID != nil, !rag.assetsReady {
                 NSLog("SonarDictate: RAG embedding model not ready yet; transcript queued via store and can be re-indexed later")
+            }
+
+            // Also write to the corpus DB - encrypted column-by-column for
+            // sensitive content. This is the long-term moat (every dictation
+            // tagged with provenance, ready to feed a custom LM trainer down
+            // the line). Runs in parallel with the legacy SecureStore writes
+            // for now; once verified, SecureStore can be retired in favor of
+            // the DB as the source of truth.
+            if let id = persistedID {
+                do {
+                    try database.recordSession(
+                        id: id,
+                        createdAt: createdAt,
+                        durationSeconds: duration,
+                        appBundle: appCtx,
+                        locale: "en-US",
+                        acousticModel: "apple.DictationTranscriber.progressiveLongDictation@macOS26",
+                        languageModel: nil,
+                        wasBroadcast: false,  // TODO: thread through commit-time selector state
+                        fnHeldMs: nil,        // TODO: capture from listening lifecycle
+                        audioPath: nil,       // TODO: surface SecureStore's audio path
+                        rawTranscript: transcript,
+                        committedText: transcript
+                    )
+                    NSLog("SonarDictate: corpus DB recorded \(id)")
+                } catch {
+                    NSLog("SonarDictate: corpus DB write failed: \(error)")
+                }
             }
         }
 
@@ -838,11 +868,15 @@ func runCLI(_ args: [String]) -> Never {
     let workflows: WorkflowStore
     let rag: RAGIndex
     let dictionary: DictionaryStore
+    let database: RecordingDatabase
     do {
         store = try SecureStore()
         workflows = try WorkflowStore()
         rag = try RAGIndex()
         dictionary = try DictionaryStore()
+        let dbURL = SecureStore.baseDir.appendingPathComponent("recordings.db")
+        database = try RecordingDatabase(at: dbURL)
+        _ = database  // currently unused in CLI commands; exercises the DB open path on every invocation
     } catch {
         fputs("error: \(error)\n", stderr)
         exit(1)
@@ -1064,23 +1098,28 @@ let logPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Lo
 freopen(logPath, "a", stderr)
 NSLog("SonarDictate: --- launch \(ISO8601DateFormatter().string(from: Date())) ---")
 
-// No args → background dictation mode.
+// No args -> background dictation mode.
 let store: SecureStore
 let workflows: WorkflowStore
 let rag: RAGIndex
 let dictionary: DictionaryStore
+let database: RecordingDatabase
 do {
     store = try SecureStore()
     workflows = try WorkflowStore()
     rag = try RAGIndex()
     dictionary = try DictionaryStore()
+    // The corpus DB lives next to the rest of the encrypted store. Master key
+    // is generated on first launch and held in Keychain (KeychainStore).
+    let dbURL = SecureStore.baseDir.appendingPathComponent("recordings.db")
+    database = try RecordingDatabase(at: dbURL)
 } catch {
     NSLog("SonarDictate: failed to init stores: \(error)")
     exit(1)
 }
 
 if #available(macOS 26.0, *) {
-    let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary)
+    let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary, database: database)
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
     let overlay = RecordingOverlay()
     let chip = TextChip()
