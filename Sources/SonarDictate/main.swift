@@ -61,6 +61,7 @@ final class Dictator {
     private let rag: RAGIndex
     private let dictionary: DictionaryStore
     private let database: RecordingDatabase
+    private let editWatcher: EditWatcher
     private var audioFrames: [AVAudioPCMBuffer] = []
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
@@ -101,12 +102,13 @@ final class Dictator {
     private let cleanup = Cleanup()
     private var sessionNeedsCleanup = false
 
-    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore, database: RecordingDatabase) {
+    init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore, database: RecordingDatabase, editWatcher: EditWatcher) {
         self.store = store
         self.workflows = workflows
         self.rag = rag
         self.dictionary = dictionary
         self.database = database
+        self.editWatcher = editWatcher
     }
 
     func bootstrap() {
@@ -536,7 +538,7 @@ final class Dictator {
         audioFrames.removeAll()
 
         // Persist asynchronously so we don't block the recognition callback
-        DispatchQueue.global(qos: .utility).async { [store, rag, database] in
+        DispatchQueue.global(qos: .utility).async { [store, rag, database, editWatcher] in
             let createdAt = Date()
             let persistedID: String?
             if let format = format, !frames.isEmpty {
@@ -606,6 +608,12 @@ final class Dictator {
                         committedText: transcript
                     )
                     NSLog("SonarDictate: corpus DB recorded \(id)")
+                    // Promote the armed edit-watcher to an active watch tied
+                    // to this recording. The 60s capture timer starts from
+                    // here; on expiry, the watcher reads the field's current
+                    // value, diffs vs the injected text, and writes any
+                    // corrections back to the DB.
+                    editWatcher.linkRecording(id)
                 } catch {
                     NSLog("SonarDictate: corpus DB write failed: \(error)")
                 }
@@ -722,11 +730,32 @@ final class Dictator {
         _ = isEditableFieldFocused()
         if AXIsProcessTrusted() {
             NSLog("SonarDictate: commit \(text.count) chars via direct inject (AX trusted)")
+            // Capture the focused element BEFORE injecting - inject pushes
+            // keystrokes which can shift focus in some apps, and we want the
+            // ref to the field we're actually typing into. The edit-watcher
+            // will use this ref to read the field's value 60s later and diff
+            // it against the text we just injected.
+            let focusedElement = currentFocusedElement()
             inject(text)
+            editWatcher.armForNextRecording(focusedElement: focusedElement, injectedText: text)
         } else {
             NSLog("SonarDictate: AX not trusted - chip fallback (\(text.count) chars)")
             chip?.present(text)
+            // Don't arm edit-watcher on chip path - we don't know which field
+            // the user will paste into, can't observe edits.
         }
+    }
+
+    // Read the system-wide focused UI element via AX. Returns nil for
+    // Electron/web contexts that don't publish kAXFocusedUIElement, OR when
+    // we lack Accessibility trust. The edit-watcher gracefully skips capture
+    // for nil cases.
+    private func currentFocusedElement() -> AXUIElement? {
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused else { return nil }
+        return (focused as! AXUIElement)
     }
 
     // Deliver text to one selector target via the reliable keystroke path.
@@ -1000,6 +1029,23 @@ func runCLI(_ args: [String]) -> Never {
             try rag.reset()
             print("RAG index cleared. Recordings retained; future dictations will rebuild the index.")
 
+        // Hidden dev path. Inserts a synthetic correction row through the full
+        // encryption + write path. Proves the EditWatcher's database call
+        // works end-to-end without requiring a real dictation + manual edit
+        // in a native field. Safe to keep - writes one debug-tagged row,
+        // queryable + removable like any other.
+        case "dev-correction":
+            let testRecId = "dev-\(UUID().uuidString)"
+            try database.addCorrection(
+                recordingId: testRecId,
+                rawPhrase: "synthetic raw text the model would have heard",
+                correctedPhrase: "synthetic corrected text the user kept",
+                position: nil,
+                weight: 1.0,
+                createdAt: Date()
+            )
+            print("inserted synthetic correction for recording_id=\(testRecId)")
+
         // Personal dictionary — the learning substrate. Terms here bias the
         // recognizer toward the user's own vocabulary every session.
         case "dict":
@@ -1118,8 +1164,14 @@ do {
     exit(1)
 }
 
+// Edit-watcher: armed by commit() right after inject, linked to a recording
+// once persistSession produces the UUID, fires the AX-read + diff + write
+// 60 seconds later (or sooner if a new injection preempts it). This is the
+// learning loop that feeds the corrections table.
+let editWatcher = EditWatcher(database: database)
+
 if #available(macOS 26.0, *) {
-    let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary, database: database)
+    let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary, database: database, editWatcher: editWatcher)
     let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
     let overlay = RecordingOverlay()
     let chip = TextChip()

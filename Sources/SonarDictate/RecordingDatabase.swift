@@ -80,6 +80,23 @@ final class RecordingDatabase {
             artifact_path TEXT NOT NULL
         );
         """),
+        (2, """
+        -- corrections: the gold labels. Each row is one (what we typed, what
+        -- the user kept) pair, captured by EditWatcher observing the focused
+        -- field for ~60s after we inject. This is the training data that lets
+        -- a custom LM learn this user's actual vocabulary - the moat.
+        CREATE TABLE IF NOT EXISTS corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recording_id TEXT NOT NULL,           -- FK -> recordings.id
+            raw_phrase_enc BLOB NOT NULL,         -- AES-GCM(what we typed)
+            corrected_phrase_enc BLOB NOT NULL,   -- AES-GCM(what the user kept)
+            position INTEGER,                     -- char offset inside the field, optional
+            weight REAL NOT NULL DEFAULT 1.0,     -- decays / boosts over time
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_corrections_recording_id ON corrections(recording_id);
+        CREATE INDEX IF NOT EXISTS idx_corrections_created_at   ON corrections(created_at);
+        """),
     ]
 
     init(at url: URL) throws {
@@ -166,6 +183,53 @@ final class RecordingDatabase {
                 try bindEncrypted(stmt, index: 11, plaintext: rawTranscript)
                 try bindEncrypted(stmt, index: 12, plaintext: committedText)
                 try bindEncrypted(stmt, index: 13, plaintext: correctedText)
+            }
+        }
+    }
+
+    // Capture a (raw, corrected) pair from the edit-watcher. Both phrases are
+    // encrypted under the keychain key before they touch disk. The recording_id
+    // links back to the source dictation; weight defaults to 1.0 and can be
+    // bumped on repeat occurrences by the trainer later.
+    func addCorrection(
+        recordingId: String,
+        rawPhrase: String,
+        correctedPhrase: String,
+        position: Int? = nil,
+        weight: Double = 1.0,
+        createdAt: Date = Date()
+    ) throws {
+        try queue.sync {
+            let sql = """
+            INSERT INTO corrections
+                (recording_id, raw_phrase_enc, corrected_phrase_enc, position, weight, created_at)
+            VALUES (?,?,?,?,?,?)
+            """
+            try execStatement(sql) { stmt in
+                sqlite3_bind_text(stmt, 1, recordingId, -1, SQLITE_TRANSIENT_FN)
+                try bindEncrypted(stmt, index: 2, plaintext: rawPhrase)
+                try bindEncrypted(stmt, index: 3, plaintext: correctedPhrase)
+                if let position = position {
+                    sqlite3_bind_int64(stmt, 4, Int64(position))
+                } else {
+                    sqlite3_bind_null(stmt, 4)
+                }
+                sqlite3_bind_double(stmt, 5, weight)
+                sqlite3_bind_int64(stmt, 6, Int64(createdAt.timeIntervalSince1970 * 1000))
+            }
+        }
+    }
+
+    // Update the corrected_text_enc column on a recording row after the
+    // edit-watcher captures the user's final text. Idempotent - latest write
+    // wins; we don't preserve history because corrections (above) capture the
+    // diff explicitly.
+    func updateCorrectedText(recordingId: String, correctedText: String) throws {
+        try queue.sync {
+            let sql = "UPDATE recordings SET corrected_text_enc = ? WHERE id = ?"
+            try execStatement(sql) { stmt in
+                try bindEncrypted(stmt, index: 1, plaintext: correctedText)
+                sqlite3_bind_text(stmt, 2, recordingId, -1, SQLITE_TRANSIENT_FN)
             }
         }
     }
