@@ -36,6 +36,7 @@ import ApplicationServices
 
 final class EditWatcher {
     private let database: RecordingDatabase
+    private let dictionary: DictionaryStore
     private let checkDelay: TimeInterval
 
     // Pending state: armed by commit(), waiting for a recording_id.
@@ -52,8 +53,9 @@ final class EditWatcher {
     // write happen on the work item's main-queue execution.
     private let queue = DispatchQueue(label: "sonar-dictate.edit-watcher")
 
-    init(database: RecordingDatabase, checkDelaySeconds: TimeInterval = 60) {
+    init(database: RecordingDatabase, dictionary: DictionaryStore, checkDelaySeconds: TimeInterval = 60) {
         self.database = database
+        self.dictionary = dictionary
         self.checkDelay = checkDelaySeconds
     }
 
@@ -150,8 +152,73 @@ final class EditWatcher {
             )
             try database.updateCorrectedText(recordingId: id, correctedText: current)
             NSLog("SonarDictate: edit-watcher captured correction for \(id) [\(reason)] -> \(current.count) chars final")
+
+            // Close the loop: promote the corrected/added words into the weighted
+            // dictionary so the NEXT session's recognizer is biased toward them.
+            // Length-gated inside learnableTerms so a big target document does not
+            // dump its whole vocabulary in. Count-only logging (terms may be PHI).
+            let learned = Self.learnableTerms(original: original, corrected: current)
+            for term in learned {
+                dictionary.add(term, weight: 3, source: .correction)
+            }
+            if !learned.isEmpty {
+                NSLog("SonarDictate: edit-watcher learned \(learned.count) term(s) into the dictionary for \(id)")
+            }
         } catch {
             NSLog("SonarDictate: edit-watcher write failed for \(id): \(error)")
         }
     }
+
+    // MARK: - Learning
+
+    // Words present in `corrected` but absent from `original` - the terms the
+    // user typed that we failed to dictate, i.e. the highest-value teaching
+    // signal. Gated so a large target document (field >> our text) does not pour
+    // its whole vocabulary in. Original casing is preserved (jargon casing
+    // matters: Kubernetes, SonarMD). Deduped case-insensitively.
+    static func learnableTerms(original: String, corrected: String) -> [String] {
+        guard !corrected.isEmpty else { return [] }
+        // Only when the field is mostly our dictated text, lightly edited.
+        guard corrected.count <= original.count * 2 + 40 else { return [] }
+
+        let originalSet = Set(tokens(in: original).map { $0.lowercased() })
+        var seen = Set<String>()
+        var result: [String] = []
+        for token in tokens(in: corrected) {
+            if token.count < 2 { continue }
+            let lower = token.lowercased()
+            if originalSet.contains(lower) { continue }   // already dictated correctly
+            if stopwords.contains(lower) { continue }
+            if seen.contains(lower) { continue }
+            seen.insert(lower)
+            result.append(token)
+        }
+        return result
+    }
+
+    // Word tokens: runs of letters/digits/apostrophe; everything else separates.
+    // Apostrophe is kept so contractions stay whole.
+    private static func tokens(in s: String) -> [String] {
+        var current = ""
+        var out: [String] = []
+        for ch in s {
+            if ch.isLetter || ch.isNumber || ch == "'" {
+                current.append(ch)
+            } else if !current.isEmpty {
+                out.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
+    }
+
+    // Trivial words that carry no teaching value if "added"; never worth biasing.
+    private static let stopwords: Set<String> = [
+        "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for",
+        "is", "it", "this", "that", "these", "those", "i", "you", "he", "she",
+        "we", "they", "my", "your", "his", "her", "our", "their", "be", "do",
+        "so", "if", "as", "by", "up", "no", "yes", "ok", "okay", "with", "was",
+        "are", "not", "just", "like", "have", "has", "had", "will", "can",
+    ]
 }

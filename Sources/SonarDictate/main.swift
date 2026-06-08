@@ -84,6 +84,10 @@ final class Dictator {
     // after every selector mutation.
     var highlighter: FieldHighlighter?
 
+    // Window listing every past dictation; opened by global hotkey or the menu.
+    // The recovery path when a live paste misses its target field.
+    var history: HistoryWindow?
+
     // Double-space commit detection: timestamp of the last space keyDown.
     private var lastSpaceDown: TimeInterval = 0
 
@@ -214,11 +218,25 @@ final class Dictator {
                 NSLog("SonarDictate: selector WIPED")
                 return
             }
-            // ⌃⌥⌫ → remove the last target.
+            //  -> remove the last target.
             if ctrlOpt, event.keyCode == 51 {  // 51 = kVK_Delete
                 self.selector.removeLast()
                 self.highlighter?.update(targets: self.selector.targets)
                 NSLog("SonarDictate: removed last target (selector now \(self.selector.count))")
+                return
+            }
+
+            // ctrl-opt-H -> open the dictation history window.
+            if ctrlOpt, event.keyCode == 4 {  // 4 = kVK_ANSI_H
+                self.history?.show()
+                return
+            }
+            // ctrl-opt-C -> copy the most recent dictation to the clipboard
+            // (instant recovery when a paste missed its target field).
+            if ctrlOpt, event.keyCode == 8 {  // 8 = kVK_ANSI_C
+                if self.history?.copyMostRecent() == true {
+                    NSLog("SonarDictate: copied last dictation to clipboard (ctrl-opt-C)")
+                }
                 return
             }
 
@@ -538,7 +556,7 @@ final class Dictator {
         audioFrames.removeAll()
 
         // Persist asynchronously so we don't block the recognition callback
-        DispatchQueue.global(qos: .utility).async { [store, rag, database, editWatcher] in
+        DispatchQueue.global(qos: .utility).async { [store, rag, database, editWatcher, chip] in
             let createdAt = Date()
             let persistedID: String?
             if let format = format, !frames.isEmpty {
@@ -552,6 +570,9 @@ final class Dictator {
                     )
                     NSLog("SonarDictate: persisted \(id) (\(audioData.count) bytes, \(String(format: "%.1fs", duration)))")
                     persistedID = id
+                    // If the live pass looks short for this much audio, re-transcribe
+                    // the file in the background and surface anything it dropped.
+                    Dictator.autoRecover(transcript: transcript, durationSeconds: duration, audioWAV: audioData, recordingId: id, chip: chip)
                 } catch {
                     NSLog("SonarDictate: persist failed: \(error.localizedDescription)")
                     persistedID = nil
@@ -641,6 +662,33 @@ final class Dictator {
         }
 
         return try Data(contentsOf: tempURL)
+    }
+
+    // Automatic word recovery. When the live (streaming) pass came back empty or
+    // suspiciously short for how much audio there is, re-transcribe the saved WAV
+    // with the file recognizer - it sees the whole utterance at once and recovers
+    // words the streaming pass dropped - and, only if it finds meaningfully more,
+    // pop the recovered text into the chip (a visible click-to-copy target, no
+    // hotkey, no clipboard clobber). Static + chip passed in because the caller's
+    // closure intentionally avoids capturing self. Logs counts only (PHI-safe).
+    static func autoRecover(transcript: String, durationSeconds: Double, audioWAV: Data, recordingId: String, chip: TextChip?) {
+        // Normal speech is ~12 chars/sec; flag clearly-low output (or empty).
+        let floor = durationSeconds * 6.0
+        let looksShort = transcript.isEmpty || Double(transcript.count) < floor
+        guard durationSeconds >= 1.0, looksShort, !audioWAV.isEmpty else { return }
+
+        DispatchQueue.global(qos: .utility).async {
+            let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("sonar-autorecover-\(recordingId).wav")
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            guard (try? audioWAV.write(to: tmp)) != nil,
+                  let recovered = try? BatchTranscriber.recoverTranscript(wavURL: tmp) else { return }
+            let trimmed = recovered.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Only surface it when recovery clearly beats the live pass.
+            guard trimmed.count > transcript.count + 4 else { return }
+            NSLog("SonarDictate: auto-recover - live \(transcript.count) -> recovered \(trimmed.count) chars for \(recordingId)")
+            DispatchQueue.main.async { chip?.present(trimmed) }
+        }
     }
 
     // PCM buffer copy — the original buffer's storage is reused by the audio
@@ -1168,7 +1216,7 @@ do {
 // once persistSession produces the UUID, fires the AX-read + diff + write
 // 60 seconds later (or sooner if a new injection preempts it). This is the
 // learning loop that feeds the corrections table.
-let editWatcher = EditWatcher(database: database)
+let editWatcher = EditWatcher(database: database, dictionary: dictionary)
 
 if #available(macOS 26.0, *) {
     let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary, database: database, editWatcher: editWatcher)
@@ -1176,10 +1224,13 @@ if #available(macOS 26.0, *) {
     let overlay = RecordingOverlay()
     let chip = TextChip()
     let highlighter = FieldHighlighter()
+    let history = HistoryWindow(store: store)
     dictator.statusItem = statusItem
     dictator.overlay = overlay
     dictator.chip = chip
     dictator.highlighter = highlighter
+    dictator.history = history
+    statusItem.history = history
     // The widget is always-on - install it now so the user can position it
     // before the first dictation. It morphs between idle (small icon) and
     // listening (expanded with live transcript) as sessions come and go.

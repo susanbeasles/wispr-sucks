@@ -1,0 +1,81 @@
+# SwiftLint configuration for SonarDictate.
+#
+# Run it with: ./scripts/lint.sh   (baseline-aware - only NEW issues fail)
+#
+# A baseline (.swiftlint-baseline.json) grandfathers the violations that existed
+# when the linter was introduced, so this gates NEW code without forcing a sweep
+# of the existing spike. Regenerate the baseline with: ./scripts/lint.sh --rebaseline
+# Lint everything ignoring the baseline with: ./scripts/lint.sh --all
+
+included:
+  - Sources
+
+excluded:
+  - .build
+  - dist
+
+# Long lines are common in this codebase's doc comments; keep the rule but
+# generous, and do not count comments / URLs / interpolated strings.
+line_length:
+  warning: 140
+  error: 250
+  ignores_comments: true
+  ignores_urls: true
+  ignores_function_declarations: true
+  ignores_interpolated_strings: true
+
+# main.swift is intentionally large (single-file orchestration). Keep the rule
+# as a smell signal, not a hard wall.
+file_length:
+  warning: 1500
+  error: 3000
+
+type_body_length:
+  warning: 600
+  error: 1000
+
+function_body_length:
+  warning: 120
+  error: 250
+
+# Allow the short, conventional names this codebase uses (id, db, pb, ch, ...).
+identifier_name:
+  min_length:
+    warning: 2
+    error: 1
+  excluded:
+    - id
+    - db
+    - pb
+    - ch
+    - w
+    - v
+    - f
+    - r
+    - n
+    - x
+    - y
+    - c
+
+# High-signal opt-in rules. Conservative set - no aggressive style churn.
+opt_in_rules:
+  - empty_count
+  - empty_string
+  - first_where
+  - last_where
+  - contains_over_first_not_nil
+  - redundant_nil_coalescing
+  - closure_spacing
+  - operator_usage_whitespace
+  - vertical_whitespace_closing_braces
+  - unneeded_parentheses_in_closure_argument
+
+custom_rules:
+  ascii_only:
+    name: "ASCII only"
+    # Match anything outside tab (0x09), LF (0x0A), CR (0x0D), and printable
+    # ASCII (0x20-0x7E). Catches em dashes, smart quotes, arrows, glyphs, BOM,
+    # zero-width and bidi marks - the ASCII LAW, enforced.
+    regex: '[^\x09\x0A\x0D\x20-\x7E]'
+    message: "Non-ASCII character. ASCII only: tab, LF, CR, 0x20-0x7E. Replace em dashes, smart quotes, arrows, and glyphs with ASCII."
+    severity: error

@@ -1,0 +1,8 @@
+{
+  "lineLength": 120,
+  "indentation": {
+    "spaces": 4
+  },
+  "respectsExistingLineBreaks": true,
+  "maximumBlankLines": 1
+}

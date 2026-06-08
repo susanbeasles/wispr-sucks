@@ -43,6 +43,15 @@ final class SpeechAnalyzerSession {
     private var volatileText: String = ""
     private let chunksQueue = DispatchQueue(label: "sonar-dictate.speech.chunks")
 
+    // Per-session diagnostics (reset each start). They distinguish "user was
+    // silent" from "recognizer dropped real speech" when a transcript comes back
+    // empty - the log alone could not tell those apart. Written from the realtime
+    // audio thread (append) and the results task; guarded by diagLock.
+    private var fedBufferCount = 0
+    private var resultCount = 0
+    private var peakAmplitude: Float = 0
+    private let diagLock = NSLock()
+
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
     var onError: (@Sendable (Error) -> Void)?
 
@@ -129,6 +138,7 @@ final class SpeechAnalyzerSession {
         self.analyzer = analyzer
 
         chunksQueue.sync { self.finalizedChunks.removeAll(); self.volatileText = "" }
+        resetDiagnostics()
 
         resultsTask = Task { [weak self] in
             guard let self else { return }
@@ -136,11 +146,14 @@ final class SpeechAnalyzerSession {
                 for try await result in transcriber.results {
                     self.handle(result: result)
                 }
+                self.logSessionDiagnostics(outcome: "completed")
                 self.emitTranscript(isFinal: true)
             } catch is CancellationError {
-                // normal cancel from stop()
+                // normal cancel from stop() (e.g. a fast re-press superseding this session)
+                self.logSessionDiagnostics(outcome: "cancelled")
             } catch {
                 NSLog("SonarDictate: transcriber.results error: \(error)")
+                self.logSessionDiagnostics(outcome: "error")
                 self.onError?(error)
             }
         }
@@ -161,6 +174,7 @@ final class SpeechAnalyzerSession {
     // mic buffer to the transcriber-compatible format, then feeds it.
     func append(buffer: AVAudioPCMBuffer) {
         guard let continuation = audioContinuation else { return }
+        recordDiagnostics(for: buffer)
         guard let converter, let outFormat = analyzerFormat else {
             // No conversion needed (formats matched) — feed directly.
             continuation.yield(AnalyzerInput(buffer: buffer))
@@ -222,8 +236,12 @@ final class SpeechAnalyzerSession {
     }
 
     private func handle(result: DictationTranscriber.Result) {
+        diagLock.lock(); resultCount += 1; diagLock.unlock()
         let plain = String(result.text.characters)
         let key = result.range.start.seconds.rounded(toMilliseconds: 3)
+        // TEMP diagnostic (content-free): the raw result stream, to see whether
+        // the recognizer ever emits the final words or the assembly drops them.
+        NSLog("SonarDictate: result isFinal=\(result.isFinal) range=[\(String(format: "%.2f", result.range.start.seconds))..\(String(format: "%.2f", result.range.end.seconds))] len=\(plain.count)")
         chunksQueue.sync {
             if result.isFinal {
                 // Committed segment: store under its range and drop the volatile
@@ -254,7 +272,60 @@ final class SpeechAnalyzerSession {
         let assembled = parts
             .joined(separator: " ")
             .replacingOccurrences(of: "  ", with: " ")
+        if isFinal {
+            // TEMP diagnostic (content-free): which final segments survived and
+            // whether a trailing volatile was still pending at finalize.
+            let starts = finals.keys.sorted().map { String(format: "%.2f", $0) }.joined(separator: ",")
+            NSLog("SonarDictate: FINAL assembled len=\(assembled.count) finals=[\(starts)] volLen=\(vol.count)")
+        }
         onTranscriptUpdate?(assembled, isFinal)
+    }
+
+    // MARK: - Diagnostics
+
+    // Zero the per-session counters. A synchronous method so the lock is never
+    // taken directly inside the async start() (unavailable in async contexts).
+    private func resetDiagnostics() {
+        diagLock.lock()
+        fedBufferCount = 0
+        resultCount = 0
+        peakAmplitude = 0
+        diagLock.unlock()
+    }
+
+    // Count one fed buffer and track the session's peak audio amplitude. Runs on
+    // the realtime audio thread; the sample scan is lock-free and the lock is held
+    // only for the brief counter update. Peak near 0 over a whole session means
+    // the mic captured (near-)silence - i.e. the user was not really speaking.
+    private func recordDiagnostics(for buffer: AVAudioPCMBuffer) {
+        var peak: Float = 0
+        if let ch = buffer.floatChannelData {
+            let n = Int(buffer.frameLength)
+            let samples = ch[0]
+            var i = 0
+            while i < n {
+                let a = abs(samples[i])
+                if a > peak { peak = a }
+                i += 1
+            }
+        }
+        diagLock.lock()
+        fedBufferCount += 1
+        if peak > peakAmplitude { peakAmplitude = peak }
+        diagLock.unlock()
+    }
+
+    // One line at session end summarizing how much audio reached the recognizer,
+    // how many results it produced, and the peak amplitude. Reading an EMPTY
+    // transcript:
+    //   fed>0, results=0, peak high  => recognizer dropped real speech (a bug)
+    //   fed>0, results=0, peak ~0    => mic heard near-silence (not a bug)
+    //   outcome=cancelled            => a fast re-press superseded this session
+    private func logSessionDiagnostics(outcome: String) {
+        diagLock.lock()
+        let fed = fedBufferCount, res = resultCount, peak = peakAmplitude
+        diagLock.unlock()
+        NSLog("SonarDictate: session diag [\(outcome)] - fed=\(fed) buffers, results=\(res), peakAmplitude=\(String(format: "%.4f", peak))")
     }
 }
 
