@@ -344,13 +344,14 @@ final class Dictator {
         finalPersisted = false
         sessionAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
-        // Decide cleanup at session start (we know the focused app now). When a
-        // cleanup app is focused, we suppress streaming entirely and inject a
-        // single cleaned transcript on finalize. For everything else (default,
-        // incl. all LLM clients) we stream raw as before.
+        // Note whether this is a cleanup-target app. Cleanup NO LONGER runs on
+        // the release path - it must never block injection (instant-on-release is
+        // the product). The flag is retained for the planned live, as-you-speak
+        // cleanup pass (.claude/plans/live-cleanup.md); for now every app injects
+        // the raw recognizer text instantly.
         sessionNeedsCleanup = Cleanup.shouldClean(appContext: sessionAppContext)
         if sessionNeedsCleanup {
-            NSLog("SonarDictate: cleanup mode ON for \(sessionAppContext ?? "?") — buffering, will clean on finalize")
+            NSLog("SonarDictate: cleanup-target app \(sessionAppContext ?? "?") - injecting raw instantly (live cleanup pass not yet wired)")
         }
 
         // NEW MODEL: never live-type into the user's real field. That was the
@@ -427,6 +428,13 @@ final class Dictator {
 
     private func stopListening() {
         listening = false
+        // Re-arm the one-shot commit slot on every release. If something stale
+        // (an overlapping session's late final) tripped finalPersisted mid-
+        // recording, this guarantees THIS session's real final still commits.
+        // Paired with the empty-final guard in finalize() - together they close
+        // the overlapping-session drop where a long, fully-recognized dictation
+        // vanished on release.
+        finalPersisted = false
         session.stop()
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
@@ -507,6 +515,18 @@ final class Dictator {
     // - Classifies for trigger words (currently log only; handlers later)
     private func finalize(transcript: String) {
         guard !finalPersisted else { return }
+
+        // An EMPTY final must never consume this session's one-shot commit slot.
+        // A stale/aborted session's late completion can deliver an empty final
+        // milliseconds AFTER a new session reset finalPersisted; if that empty
+        // final claimed the slot, the new session's real (non-empty) final would
+        // hit the guard above and be SILENTLY DROPPED - the "long dictation shows
+        // in the widget, then vanishes on release" bug. Empty finals are no-ops:
+        // do not claim the slot, do not persist.
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            NSLog("SonarDictate: empty final ignored - commit slot preserved")
+            return
+        }
         finalPersisted = true
 
         // Classify trigger (user-defined workflow bindings win over built-in triggers).
@@ -746,15 +766,20 @@ final class Dictator {
             NSLog("SonarDictate: empty transcript - nothing to commit (short hold or no speech detected)")
             return
         }
-        if sessionNeedsCleanup {
-            Task { [weak self] in
-                guard let self else { return }
-                let cleaned = await self.cleanup.clean(trimmed)
-                await MainActor.run { self.commit(cleaned) }
-            }
-        } else {
-            commit(trimmed)
-        }
+        // INSTANT injection is the entire product: the text must be in the field
+        // the moment the key is released - never hanging on processing. The old
+        // path did `await cleanup.clean()` (an on-device LLM, ~seconds) BEFORE
+        // injecting in cleanup-target apps, which is the multi-second release
+        // hang - a death sentence. Cleanup is NOT allowed to block release.
+        //
+        // Inject the recognizer's final text immediately. The recognizer already
+        // revises words live as you speak (that real-time word-changing shows in
+        // the widget). The LLM pass only repairs punctuation/capitalization and is
+        // word-preserving; doing that as a live, as-you-speak pass (so the cleaned
+        // text is ready AT release, not computed after it) is the proper design
+        // and is tracked in .claude/plans/live-cleanup.md. Until then, raw-instant
+        // beats polished-but-laggy every time.
+        commit(trimmed)
     }
 
     // Routing priority:
@@ -899,21 +924,58 @@ final class Dictator {
 
     private func inject(_ text: String) {
         guard !text.isEmpty else { return }
-        // Diagnostic: confirms inject is reached + whether we're trusted to
-        // synthesize input. AXIsProcessTrusted() == false here means the
-        // Accessibility grant (separate from Input Monitoring) is missing and
-        // every post() below is silently dropped.
-        NSLog("SonarDictate: inject \(text.count) chars (AXtrusted=\(AXIsProcessTrusted()))")
+        // PASTE, don't type. Char-by-char keystroke synthesis posts 2 events per
+        // character (1686 for an 843-char utterance); slow targets - Electron and
+        // terminal inputs especially - can't drain that flood, so long text lands
+        // in stalled chunks ("two letters, hang, then the rest") or gets partially
+        // dropped. A single Cmd-V delivers any length in one action, instantly.
+        //
+        // The dictated text is left on the clipboard deliberately: restoring the
+        // previous contents on a timer would race a slow paste and could inject
+        // stale clipboard data into the user's field - a far worse failure than a
+        // clobbered clipboard. (Matches the chip path, which also does not restore.)
+        let trusted = AXIsProcessTrusted()  // false => Accessibility missing; the paste keystroke is silently dropped
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard pb.setString(text, forType: .string) else {
+            NSLog("SonarDictate: pasteboard set failed - falling back to keystroke inject (\(text.count) chars)")
+            injectByKeystroke(text)
+            return
+        }
+        NSLog("SonarDictate: inject \(text.count) chars via paste (AXtrusted=\(trusted))")
+        postPaste()
+    }
 
+    // Synthesize Cmd-V. Command is pressed and released around V (rather than
+    // relying on a flag on the V event alone) so apps that watch for an explicit
+    // modifier keyDown still register the paste.
+    private func postPaste() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let cmd: CGKeyCode = 0x37  // kVK_Command
+        let v: CGKeyCode = 0x09    // kVK_ANSI_V
+        let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: cmd, keyDown: true)
+        let vDown = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: true)
+        let vUp = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: false)
+        let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: cmd, keyDown: false)
+        cmdDown?.flags = .maskCommand
+        vDown?.flags = .maskCommand
+        vUp?.flags = .maskCommand
+        cmdUp?.flags = []
+        cmdDown?.post(tap: .cghidEventTap)
+        vDown?.post(tap: .cghidEventTap)
+        vUp?.post(tap: .cghidEventTap)
+        cmdUp?.post(tap: .cghidEventTap)
+    }
+
+    // Fallback only: per-character synthesis, used when the pasteboard can't be
+    // set. Clears modifier flags so a held hotkey modifier doesn't turn the
+    // synthesized keys into dead-key combos.
+    private func injectByKeystroke(_ text: String) {
         let source = CGEventSource(stateID: .hidSystemState)
         for char in Array(text.utf16) {
             var ch = char
             let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
             let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-            // CRITICAL: clear modifier flags. The user is physically holding
-            // Option (our hotkey) while we stream-inject, so without this the
-            // synthesized events become Option+<char> and produce dead keys /
-            // nothing instead of the literal text.
             down?.flags = []
             up?.flags = []
             down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &ch)
@@ -1135,6 +1197,17 @@ func runCLI(_ args: [String]) -> Never {
                 exit(2)
             }
 
+        case "logs":
+            if rest.first == "--follow" || rest.first == "-f" {
+                try EncryptedLog.follow()   // never returns
+            }
+            let text = try EncryptedLog.readAll()
+            if text.isEmpty {
+                print("(log is empty)")
+            } else {
+                FileHandle.standardOutput.write(Data(text.utf8))
+            }
+
         case "help", "-h", "--help":
             print("""
             usage:  sonar-dictate <command> [args...]
@@ -1162,6 +1235,10 @@ func runCLI(_ args: [String]) -> Never {
               dict rm "<term>"              remove a term
               dict reset                    wipe the dictionary
 
+            diagnostics:
+              logs                          decrypt and print the diagnostic log
+              logs --follow                 live-tail the decrypted log (Ctrl-C to stop)
+
             (no args)  launch background dictation app
             """)
         default:
@@ -1183,14 +1260,13 @@ if !cliArgs.isEmpty {
     runCLI(cliArgs)
 }
 
-// Mirror stderr (where NSLog also writes) to a readable plaintext log. The
-// unified log redacts our interpolated NSLog messages as <private>, so
-// `log show` is useless for our own diagnostics; redirecting fd 2 to
-// ~/Library/Logs/SonarDictate.log captures every NSLog verbatim with zero
-// per-call changes — the idiomatic macOS app log location, greppable by us.
-let logPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SonarDictate.log")
-freopen(logPath, "a", stderr)
-NSLog("SonarDictate: --- launch \(ISO8601DateFormatter().string(from: Date())) ---")
+// Diagnostics go to an ENCRYPTED, append-only log. The old behavior redirected
+// fd 2 (where NSLog writes) into a plaintext ~/Library/Logs/SonarDictate.log,
+// which left every line in cleartext on a PHI machine. EncryptedLog pipes stderr
+// through an in-process AES-256-GCM sink keyed by the Keychain DB key, migrates
+// any pre-existing plaintext log into the encrypted file, and removes the
+// cleartext. Read it back with `sonar-dictate logs [--follow]`.
+EncryptedLog.install()
 
 // No args -> background dictation mode.
 let store: SecureStore
@@ -1220,7 +1296,7 @@ let editWatcher = EditWatcher(database: database, dictionary: dictionary)
 
 if #available(macOS 26.0, *) {
     let dictator = Dictator(store: store, workflows: workflows, rag: rag, dictionary: dictionary, database: database, editWatcher: editWatcher)
-    let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag)
+    let statusItem = StatusItemController(store: store, workflows: workflows, rag: rag, dictionary: dictionary)
     let overlay = RecordingOverlay()
     let chip = TextChip()
     let highlighter = FieldHighlighter()
@@ -1236,6 +1312,9 @@ if #available(macOS 26.0, *) {
     // listening (expanded with live transcript) as sessions come and go.
     overlay.install()
     dictator.bootstrap()
+    // Warm the speech model in the background at launch (no mic) so the FIRST
+    // dictation isn't the slow one - kills the "big delay when I first start".
+    Task.detached(priority: .utility) { await SpeechAnalyzerSession.prewarm() }
     NSApplication.shared.run()
 } else {
     NSLog("SonarDictate requires macOS 26.0+ (SpeechAnalyzer is unavailable on this OS)")

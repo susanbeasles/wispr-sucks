@@ -52,6 +52,15 @@ final class SpeechAnalyzerSession {
     private var peakAmplitude: Float = 0
     private let diagLock = NSLock()
 
+    // LED widget confidence proxy: the recognizer's volatile-tail churn. A
+    // retracted (shortened) volatile guess reads as uncertainty; steady growth
+    // reads as confidence. Feeds the floating widget's integrity layer via
+    // WidgetSignals - it is NOT consumed by transcription. Written only from the
+    // serial results task (handle), so no lock needed. Replace with a real
+    // transcriptionConfidence read when that attribute is wired.
+    private var prevVolatileLen = 0
+    private var confProxy: Float = 1
+
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
     var onError: (@Sendable (Error) -> Void)?
 
@@ -137,6 +146,18 @@ final class SpeechAnalyzerSession {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
 
+        // Hand the contextual-strings bias (personal dictionary + RAG terms, set
+        // via setContextualStrings before start()) TO the analyzer. This was the
+        // missing wire: the AnalysisContext was populated but never applied, so the
+        // recognizer got zero bias and mangled jargon ("git"->"get", "egress"->
+        // "addresses") even when the term was already in the dictionary. Best-effort
+        // - a context-set failure must never break dictation.
+        do {
+            try await analyzer.setContext(context)
+        } catch {
+            NSLog("SonarDictate: setContext failed (\(error.localizedDescription)); proceeding without vocabulary bias")
+        }
+
         chunksQueue.sync { self.finalizedChunks.removeAll(); self.volatileText = "" }
         resetDiagnostics()
 
@@ -206,6 +227,36 @@ final class SpeechAnalyzerSession {
         }
     }
 
+    // Warm the speech recognition stack at app launch so the FIRST real
+    // dictation doesn't pay the one-time cold model-load cost (the "big delay
+    // when I first start"). Spins up a THROWAWAY analyzer and feeds it ~100ms of
+    // synthetic silence in the analyzer's own format - no AVAudioEngine, no mic,
+    // no privacy indicator, no permission prompt. Best-effort: any failure is
+    // ignored (the real session, a separate instance, still works cold). Only
+    // warms when assets are already installed; never triggers a download here.
+    static func prewarm(locale: Locale = Locale(identifier: "en-US")) async {
+        let transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
+        guard await AssetInventory.status(forModules: [transcriber]) == .installed else { return }
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else { return }
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
+        let frames = AVAudioFrameCount(format.sampleRate * 0.1)  // ~100ms
+        if let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) {
+            silence.frameLength = frames  // contents are silence/garbage; output is discarded
+            continuation.yield(AnalyzerInput(buffer: silence))
+        }
+        continuation.finish()
+
+        do {
+            try await analyzer.start(inputSequence: stream)
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+            NSLog("SonarDictate: speech model prewarmed at launch")
+        } catch {
+            NSLog("SonarDictate: prewarm skipped (\(error.localizedDescription))")
+        }
+    }
+
     // MARK: - Internals
 
     private func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, to outFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
@@ -242,10 +293,34 @@ final class SpeechAnalyzerSession {
         // TEMP diagnostic (content-free): the raw result stream, to see whether
         // the recognizer ever emits the final words or the assembly drops them.
         NSLog("SonarDictate: result isFinal=\(result.isFinal) range=[\(String(format: "%.2f", result.range.start.seconds))..\(String(format: "%.2f", result.range.end.seconds))] len=\(plain.count)")
+
+        // LED widget signals (additive; not consumed by transcription). Confidence
+        // is proxied from volatile-tail churn; a non-empty final is a "snap" pulse.
+        if result.isFinal {
+            if !plain.isEmpty {
+                confProxy = min(1, confProxy + 0.1)
+                WidgetSignals.shared.publishConfidence(confProxy)
+                WidgetSignals.shared.snap()
+            }
+        } else {
+            let len = plain.count
+            confProxy = len < prevVolatileLen ? max(0.2, confProxy - 0.18) : min(1, confProxy + 0.04)
+            prevVolatileLen = len
+            WidgetSignals.shared.publishConfidence(confProxy)
+        }
+
         chunksQueue.sync {
             if result.isFinal {
+                // An empty final must NOT wipe the volatile tail. DictationTranscriber
+                // (and the forced flush in stop()/finalizeAndFinishThroughEndOfInput)
+                // can emit a final result with empty text at a segment boundary. If we
+                // stored "" and cleared volatileText, we would drop the words the user
+                // just said and still has on screen - the "swallowed the whole thing,
+                // shows empty" bug. An empty final carries no words to commit, so ignore
+                // it entirely and keep the live tail intact.
+                guard !plain.isEmpty else { return }
                 // Committed segment: store under its range and drop the volatile
-                // tail it supersedes — otherwise the in-progress copy doubles it.
+                // tail it supersedes - otherwise the in-progress copy doubles it.
                 self.finalizedChunks[key] = plain
                 self.volatileText = ""
             } else {
@@ -291,6 +366,9 @@ final class SpeechAnalyzerSession {
         resultCount = 0
         peakAmplitude = 0
         diagLock.unlock()
+        // Results-task-owned LED proxy state; reset here (runs before resultsTask starts).
+        prevVolatileLen = 0
+        confProxy = 1
     }
 
     // Count one fed buffer and track the session's peak audio amplitude. Runs on
@@ -299,6 +377,8 @@ final class SpeechAnalyzerSession {
     // the mic captured (near-)silence - i.e. the user was not really speaking.
     private func recordDiagnostics(for buffer: AVAudioPCMBuffer) {
         var peak: Float = 0
+        var sumSq: Float = 0
+        var count = 0
         if let ch = buffer.floatChannelData {
             let n = Int(buffer.frameLength)
             let samples = ch[0]
@@ -306,8 +386,15 @@ final class SpeechAnalyzerSession {
             while i < n {
                 let a = abs(samples[i])
                 if a > peak { peak = a }
+                sumSq += samples[i] * samples[i]
                 i += 1
             }
+            count = n
+        }
+        // Additive, behavior-free: publish this buffer's RMS to the widget LED bus.
+        // Realtime audio thread; WidgetSignals.publishEnergy is a single lock + store.
+        if count > 0 {
+            WidgetSignals.shared.publishEnergy((sumSq / Float(count)).squareRoot())
         }
         diagLock.lock()
         fedBufferCount += 1

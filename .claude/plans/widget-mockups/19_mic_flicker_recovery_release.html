@@ -1,0 +1,129 @@
+<h2 class="sr-only">The dictation widget, refined: confidence degradation is now primarily flicker rather than missing blocks, like a weak electrical connection struggling to stay lit, with genuine missing cells kept rare and reserved for seriously low confidence. A recovery animation plays when confidence rises: flicker stabilizes, holes heal, saturation floods back and overshoots to a peak white bloom, and the mic locks on. A release animation plays the final commit: motion freezes stable, the mic pulses, and a light travels around the rounded border, its strength set by final confidence. Controls: scenario presets, energy noise and confidence sliders, speculative-final toggle, finalize, recover, and release.</h2>
+
+<div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:0 0 12px;">
+  <span style="font-size:12px;color:var(--color-text-tertiary);">scenario</span>
+  <button class="sc on" data-e="0.85" data-n="0.12" data-c="0.96">Clear</button>
+  <button class="sc" data-e="0.80" data-n="0.20" data-c="0.40">Mumbling</button>
+  <button class="sc" data-e="0.34" data-n="0.10" data-c="0.93">Quiet+clear</button>
+  <button class="sc" data-e="0.90" data-n="0.92" data-c="0.95">Noisy+understood</button>
+  <button class="sc" data-e="0.92" data-n="0.90" data-c="0.20">Noisy+lost</button>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:0 0 12px;">
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">energy</label><input type="range" id="energy" min="0" max="1" step="0.01" value="0.85" style="width:90px;"></div>
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">noise</label><input type="range" id="noise" min="0" max="1" step="0.01" value="0.12" style="width:90px;"></div>
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">confidence</label><input type="range" id="conf" min="0" max="1" step="0.01" value="0.96" style="width:90px;"></div>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 14px;">
+  <button id="spec" class="on">Speculative</button>
+  <button id="snap"><i class="ti ti-lock" aria-hidden="true" style="font-size:13px;vertical-align:-2px;margin-right:3px;"></i>Finalize</button>
+  <button id="recover"><i class="ti ti-arrows-up" aria-hidden="true" style="font-size:13px;vertical-align:-2px;margin-right:3px;"></i>Recover</button>
+  <button id="release"><i class="ti ti-circle-check" aria-hidden="true" style="font-size:13px;vertical-align:-2px;margin-right:3px;"></i>Release</button>
+</div>
+
+<div id="desk" style="border-radius:var(--border-radius-lg);background:#1b1c20;padding:24px;display:flex;justify-content:center;align-items:center;min-height:250px;">
+  <div style="text-align:center;">
+    <svg viewBox="0 0 24 24" width="200" height="200" role="img" aria-label="Confidence mic with flicker, recovery and release">
+      <defs><clipPath id="tt"><rect x="0.6" y="0.6" width="22.8" height="22.8" rx="5"></rect></clipPath></defs>
+      <rect x="0.6" y="0.6" width="22.8" height="22.8" rx="5" fill="#060607"></rect>
+      <g id="px" clip-path="url(#tt)" shape-rendering="crispEdges"></g>
+      <g id="icon" fill="none" stroke="#ff2e3a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 5 a3 3 0 0 1 6 0 v6 a3 3 0 0 1 -6 0 z"></path><path d="M6 12 a6 6 0 0 0 12 0"></path><line x1="12" y1="18" x2="12" y2="20.6"></line><line x1="8.6" y1="20.7" x2="15.4" y2="20.7"></line>
+      </g>
+      <rect id="bglow" x="0.9" y="0.9" width="22.2" height="22.2" rx="4.7" fill="none" stroke="#dfeaff" stroke-width="1.1" pathLength="100" stroke-dasharray="0 100" stroke-dashoffset="0" stroke-linecap="round" opacity="0"></rect>
+      <rect id="border" x="0.9" y="0.9" width="22.2" height="22.2" rx="4.7" fill="none" stroke="#eaf2ff" stroke-width="0.5" pathLength="100" stroke-dasharray="0 100" stroke-dashoffset="0" stroke-linecap="round" opacity="0"></rect>
+    </svg>
+    <div id="cap" style="margin-top:10px;font-size:12px;color:#8a8c94;font-family:var(--font-mono);">e85 n12 c96 spec</div>
+    <div id="read" style="margin-top:4px;font-size:12px;color:#6c6e78;">locked on - understood</div>
+  </div>
+</div>
+
+<style>.sc,#spec,#snap,#recover,#release{font-size:12px;padding:4px 9px;}.sc.on,#spec.on{border-color:var(--color-border-primary);background:var(--color-background-secondary);font-weight:500;}</style>
+
+<script>
+(function(){
+  var NS='http://www.w3.org/2000/svg';
+  var energyEl=document.getElementById('energy'),noiseEl=document.getElementById('noise'),confEl=document.getElementById('conf'),spec=document.getElementById('spec'),snapBtn=document.getElementById('snap'),recBtn=document.getElementById('recover'),relBtn=document.getElementById('release'),icon=document.getElementById('icon'),px=document.getElementById('px'),cap=document.getElementById('cap'),read=document.getElementById('read'),border=document.getElementById('border'),bglow=document.getElementById('bglow');
+  var RED=[255,59,48],BLUE=[46,123,255],PUR=[122,63,240],GRAY=[120,120,130],REC=[255,46,58],WHITE=[255,255,255];
+  var X0=1.0,Y0=1.0,W=22,H=22,pitch=1.2,bp=0.52,burn=0.18;
+  var cols=18,rows=18,cells=[],ph=[],fr=[],iw=[],ipa=[],cgph=[],rm=[],gp=[],hgt=[];
+  var E=0.85,Ntar=0.12,Ctar=0.96,finalState=false;
+  function rgb(a){return 'rgb('+Math.round(a[0])+','+Math.round(a[1])+','+Math.round(a[2])+')';}
+  function lp(a,b,t){return [a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];}
+  function spectrum(f){return f<=bp?lp(RED,BLUE,f/bp):lp(BLUE,PUR,(f-bp)/(1-bp));}
+  function cl(v,a,b){return v<a?a:(v>b?b:v);}
+  function build(){
+    cols=Math.floor(W/pitch);rows=Math.floor(H/pitch);
+    var cw=W/cols,ch=H/rows,sz=Math.min(cw,ch)*0.84;cells=[];ph=[];fr=[];iw=[];ipa=[];cgph=[];rm=[];gp=[];hgt=[];px.innerHTML='';
+    for(var c=0;c<cols;c++){cells[c]=[];ph[c]=[];fr[c]=[];rm[c]=[];gp[c]=[];iw[c]=1.4+Math.random()*2.4;ipa[c]=Math.random()*6.28;cgph[c]=Math.random()*6.28;hgt[c]=0;
+      for(var row=0;row<rows;row++){var r=document.createElementNS(NS,'rect');
+        r.setAttribute('x',(X0+c*cw+(cw-sz)/2).toFixed(3));r.setAttribute('y',(Y0+row*ch+(ch-sz)/2).toFixed(3));
+        r.setAttribute('width',sz.toFixed(3));r.setAttribute('height',sz.toFixed(3));r.setAttribute('stroke','#000');r.setAttribute('stroke-width','0.08');r.setAttribute('opacity','0');
+        px.appendChild(r);var b=rows-1-row;cells[c][b]=r;ph[c][b]=Math.random()*6.28;fr[c][b]=6+Math.random()*9;rm[c][b]=Math.random();gp[c][b]=Math.random()*6.28;}
+    }
+  }
+  function setSpec(on){finalState=!on;spec.classList.toggle('on',on);spec.textContent=on?'Speculative':'Final';caption();}
+  function caption(){var line;if(Ctar>0.72)line=Ntar>0.6?'noisy room - still got you':'locked on - understood';else if(Ctar>0.4)line='parsing - flickering';else line=Ntar>0.6?'noise winning - lost you':'clear audio - cant parse';
+    cap.textContent='e'+Math.round(E*100)+' n'+Math.round(Ntar*100)+' c'+Math.round(Ctar*100)+' '+(finalState?'final':'spec');read.textContent=line;}
+  document.querySelectorAll('.sc').forEach(function(b){b.onclick=function(){E=+b.dataset.e;Ntar=+b.dataset.n;Ctar=+b.dataset.c;energyEl.value=E;noiseEl.value=Ntar;confEl.value=Ctar;document.querySelectorAll('.sc').forEach(function(x){x.classList.toggle('on',x===b);});caption();};});
+  energyEl.oninput=function(){E=+energyEl.value;caption();};noiseEl.oninput=function(){Ntar=+noiseEl.value;caption();};confEl.oninput=function(){Ctar=+confEl.value;caption();};
+  spec.onclick=function(){setSpec(finalState);};
+  var snapStart=-9,recStart=-9,relStart=-9,lockStr=0;
+  snapBtn.onclick=function(){snapStart=NOW;};
+  recBtn.onclick=function(){c=0.15;Ctar=0.96;confEl.value=0.96;recStart=NOW;caption();};
+  relBtn.onclick=function(){lockStr=cl(c,0,1);if(NOW-recStart<1.6)lockStr=Math.min(1,lockStr+0.25);relStart=NOW;};
+
+  var c=0.96,e=0.85,nz=0.12,NOW=0,lastAuto=0;
+  function flick(t,phc,depth){if(depth<=0.002)return 1;var waver=depth*0.22*(0.5+0.5*Math.sin(t*17+phc));var stut=(Math.sin(t*30+phc*2.3)>(1-depth*0.55))?depth*0.6:0;return Math.max(0.14,1-waver-stut);}
+  function tick(ts){
+    var t=ts/1000;NOW=t;
+    e+=(E-e)*0.18;c+=(Ctar-c)*0.08;nz+=(Ntar-nz)*0.1;
+    if(!finalState && t-lastAuto>2.4){snapStart=t;lastAuto=t;}
+    var snP=(t-snapStart)/0.13,inSnap=snP>=0&&snP<1;
+    var rP=(t-recStart)/0.6,rec=(rP>=0&&rP<1)?Math.sin(rP*Math.PI):0;
+    var reP=(t-relStart)/1.0,inRel=reP>=0&&reP<1;
+    var gap=cl(1-c,0,1);if(inSnap)gap*=(1-snP);gap*=(1-rec);if(inRel)gap=0;
+    var dsat=gap*0.55;var whiteMix=rec*0.28;
+    var fdepth=cl((gap-0.12)/0.7,0,1);
+    var missCh=gap>0.5?(gap-0.5)*0.5:0;
+    for(var col=0;col<cols;col++){
+      var organized=Math.sin(t*2*Math.PI*1.3+col*0.62);
+      var disorg=Math.sin(t*iw[col]+ipa[col])*0.7+Math.sin(t*iw[col]*2.3+col*1.7)*0.3;
+      var m=(1-nz)*organized+nz*disorg;
+      var swing=(0.5+0.5*m)*(0.72+nz*0.55);
+      var target=cl(e*(0.42+0.6*swing),0,1);
+      hgt[col]+=(target-hgt[col])*(inRel?0:(0.16+0.5*nz));
+      var lit=Math.round(hgt[col]*rows);
+      for(var b=0;b<rows;b++){var cell=cells[col][b];
+        if(b<lit){
+          var missing=missCh>0 && rm[col][b]<missCh && (0.5+0.5*Math.sin(t*0.9+gp[col][b]))<0.55;
+          if(missing){cell.setAttribute('opacity','0.04');continue;}
+          var base=(b===lit-1)?PUR:spectrum(rows>1?b/(rows-1):0);
+          var color=lp(base,GRAY,dsat);if(whiteMix>0)color=lp(color,WHITE,whiteMix);
+          cell.setAttribute('fill',rgb(color));
+          var bf=0.5+0.5*Math.sin(t*fr[col][b]+ph[col][b]);
+          var op=(1-burn+burn*bf)*flick(t,gp[col][b]*3.1,inRel?0:fdepth);
+          cell.setAttribute('opacity',cl(op,0.14,1).toFixed(3));
+        }else cell.setAttribute('opacity','0');
+      }
+    }
+    var breathe=cl(0.78-c,0,0.5)*cl((c-0.28)/0.22,0,1)*0.05*Math.sin(t*2*Math.PI*0.55);
+    var wobA=cl((0.42-c)/0.42,0,1);if(inRel||rec>0)wobA*=(1-Math.max(rec,inRel?1:0));
+    var wx=wobA*0.32*Math.sin(t*5.3)*Math.sin(t*2.1+1),wy=wobA*0.30*Math.sin(t*4.1+2)*Math.sin(t*1.7);
+    var sc=1+breathe+rec*0.06;
+    if(inSnap)sc=1-0.05*Math.sin(snP*Math.PI);
+    if(inRel)sc=1+0.06*Math.sin(reP*Math.PI);
+    icon.setAttribute('transform','translate('+(12+wx).toFixed(3)+' '+(12+wy).toFixed(3)+') scale('+sc.toFixed(4)+') translate(-12 -12)');
+    var micSat=(1-c)*0.55*(1-rec);if(inRel)micSat=0;
+    icon.setAttribute('stroke',rgb(lp(REC,GRAY,micSat)));
+    icon.setAttribute('opacity',cl(0.58+0.42*c+rec*0.3+(inRel?0.25:0),0,1).toFixed(3));
+    // border resolution glow on release - a light traveling the frame
+    if(inRel){var seg=10+lockStr*24,laps=1+(lockStr>0.7?0.6:0),off=-(100*laps)*reP;
+      var fade=reP<0.82?1:(1-(reP-0.82)/0.18);
+      border.setAttribute('stroke-dasharray',seg.toFixed(1)+' '+(100-seg).toFixed(1));border.setAttribute('stroke-dashoffset',off.toFixed(1));border.setAttribute('opacity',(lockStr*fade).toFixed(3));
+      bglow.setAttribute('stroke-dasharray',(seg*1.6).toFixed(1)+' '+(100-seg*1.6).toFixed(1));bglow.setAttribute('stroke-dashoffset',off.toFixed(1));bglow.setAttribute('opacity',(lockStr*fade*0.25).toFixed(3));
+    }else{border.setAttribute('opacity','0');bglow.setAttribute('opacity','0');}
+    requestAnimationFrame(tick);
+  }
+  build();setSpec(true);requestAnimationFrame(tick);
+})();
+</script>

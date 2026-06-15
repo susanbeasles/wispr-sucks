@@ -30,7 +30,7 @@ final class RecordingOverlay {
 
     private var window: DraggableWidgetWindow?
     private var bg: NSVisualEffectView?
-    private var icon: NSImageView?
+    private var led: LEDMicView?
     private var statusLabel: NSTextField?
     private var transcriptLabel: NSTextField?
 
@@ -46,25 +46,29 @@ final class RecordingOverlay {
         }
     }
 
-    // Listening state - expand the widget, red mic, clear transcript. Called
-    // on Option-down.
+    // Listening state - expand the widget, wake the LED mic, clear transcript.
+    // Called on fn-down.
     func show() {
         DispatchQueue.main.async {
             self.ensureWindow()
             self.applyListening()
             self.transcriptLabel?.stringValue = ""
             self.statusLabel?.stringValue = "Listening..."
-            self.icon?.contentTintColor = .systemRed
+            WidgetSignals.shared.setListening(true)
+            self.led?.beginListening()
             self.window?.orderFront(nil)
         }
     }
 
-    // Back to idle - collapse, dim the icon, clear text. Called on Option-up.
-    // The widget stays visible (it's the user's persistent draggable icon).
+    // Back to idle - clear text and release the LED mic (which plays its lock /
+    // power-down animation, then settles to a faint idle outline). Called on
+    // fn-up. The widget stays visible (it's the user's persistent draggable icon).
     func hide() {
         DispatchQueue.main.async {
             self.transcriptLabel?.stringValue = ""
             self.statusLabel?.stringValue = ""
+            WidgetSignals.shared.setListening(false)
+            self.led?.endListening()
             self.applyIdle()
         }
     }
@@ -87,7 +91,6 @@ final class RecordingOverlay {
     func setBufferingMode(_ buffering: Bool) {
         DispatchQueue.main.async {
             self.statusLabel?.stringValue = buffering ? "Action" : "Listening..."
-            self.icon?.contentTintColor = buffering ? .systemBlue : .systemRed
         }
     }
 
@@ -102,8 +105,8 @@ final class RecordingOverlay {
         let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
         w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
         bg?.frame = NSRect(origin: .zero, size: size)
-        icon?.frame = NSRect(x: (size.width - 24) / 2, y: (size.height - 24) / 2, width: 24, height: 24)
-        icon?.contentTintColor = .secondaryLabelColor
+        led?.frame = NSRect(x: (size.width - 36) / 2, y: (size.height - 36) / 2, width: 36, height: 36)
+        led?.needsDisplay = true
         statusLabel?.isHidden = true
         transcriptLabel?.isHidden = true
         w.alphaValue = 0.55   // subtle when not dictating
@@ -117,7 +120,7 @@ final class RecordingOverlay {
         let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
         w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
         bg?.frame = NSRect(origin: .zero, size: size)
-        icon?.frame = NSRect(x: 14, y: (size.height - 24) / 2, width: 24, height: 24)
+        led?.frame = NSRect(x: 8, y: (size.height - 44) / 2, width: 44, height: 44)
         statusLabel?.frame = NSRect(x: 46, y: 30, width: 110, height: 16)
         statusLabel?.isHidden = false
         transcriptLabel?.frame = NSRect(x: 46, y: 6, width: size.width - 60, height: 24)
@@ -178,21 +181,22 @@ final class RecordingOverlay {
         w.isMovableByWindowBackground = true   // drag from anywhere on the widget
         w.onDragEnd = { [weak self] in self?.savePosition() }
 
-        let background = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        let background = DragPassthroughEffectView(frame: NSRect(origin: .zero, size: size))
         background.material = .hudWindow
         background.blendingMode = .behindWindow
         background.state = .active
+        // Force the dark variant so the pill is near-black (the LED tile reads
+        // washed out on the light-gray hudWindow). The mic tile draws its own
+        // #060607 background; this just darkens the surrounding pill.
+        background.appearance = NSAppearance(named: .darkAqua)
         background.wantsLayer = true
         background.layer?.cornerRadius = 14
         background.layer?.masksToBounds = true
         bg = background
 
-        let img = NSImageView(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
-        img.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Microphone")
-        img.contentTintColor = .secondaryLabelColor
-        img.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
-        background.addSubview(img)
-        icon = img
+        let ledView = LEDMicView(frame: NSRect(x: 0, y: 0, width: 36, height: 36))
+        background.addSubview(ledView)
+        led = ledView
 
         let status = NSTextField(frame: NSRect(x: 46, y: 30, width: 110, height: 16))
         status.isEditable = false
@@ -226,6 +230,20 @@ final class RecordingOverlay {
 
         w.contentView = background
         window = w
+    }
+}
+
+// The widget's background. It is display + drag only - nothing inside it is
+// clickable - so every click anywhere in its bounds resolves to THIS view rather
+// than to a subview. That matters because the mic icon (NSImageView) and the text
+// labels (NSTextField) are NSControls, which return mouseDownCanMoveWindow=false
+// and would otherwise swallow the click and block isMovableByWindowBackground -
+// the "I can't drag from the icon, only from outside it" bug. As a plain NSView,
+// this view allows window-background dragging, so the whole widget drags.
+final class DragPassthroughEffectView: NSVisualEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Inside the widget -> us (draggable). Outside -> nil (pass through).
+        return super.hitTest(point) == nil ? nil : self
     }
 }
 

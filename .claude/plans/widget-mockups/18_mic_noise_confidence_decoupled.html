@@ -1,0 +1,112 @@
+<h2 class="sr-only">The dictation widget with three fully independent signals on the approved red-blue-purple palette. Energy sets bar height. Noise controls motion only: low noise is a smooth rhythmic synchronized wave, high noise is turbulent and desynchronized but not weaker. Confidence controls signal integrity and saturation only: high confidence is dense continuous blocks with no gaps and full saturation, low confidence drops cells and breaks columns into a lossy fragmented signal and desaturates. The microphone reflects confidence alone, so it stays locked and fully red in a noisy room as long as the speaker is understood. Finalization briefly heals the gaps, pops saturation, and locks the mic. Presets include clear speech, mumbling, quiet but clear, noisy but understood, and noisy and lost.</h2>
+
+<div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:0 0 12px;">
+  <span style="font-size:12px;color:var(--color-text-tertiary);">scenario</span>
+  <button class="sc on" data-e="0.85" data-n="0.12" data-c="0.96">Clear</button>
+  <button class="sc" data-e="0.80" data-n="0.20" data-c="0.30">Mumbling</button>
+  <button class="sc" data-e="0.34" data-n="0.10" data-c="0.93">Quiet+clear</button>
+  <button class="sc" data-e="0.90" data-n="0.92" data-c="0.95">Noisy+understood</button>
+  <button class="sc" data-e="0.92" data-n="0.90" data-c="0.15">Noisy+lost</button>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:0 0 12px;">
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">energy</label><input type="range" id="energy" min="0" max="1" step="0.01" value="0.85" style="width:95px;"></div>
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">noise</label><input type="range" id="noise" min="0" max="1" step="0.01" value="0.12" style="width:95px;"></div>
+  <div style="display:flex;align-items:center;gap:7px;"><label style="font-size:13px;color:var(--color-text-secondary);">confidence</label><input type="range" id="conf" min="0" max="1" step="0.01" value="0.96" style="width:95px;"></div>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:0 0 14px;">
+  <button id="spec" class="on">Speculative</button>
+  <button id="snap"><i class="ti ti-lock" aria-hidden="true" style="font-size:14px;vertical-align:-2px;margin-right:4px;"></i>Finalize</button>
+</div>
+
+<div id="desk" style="border-radius:var(--border-radius-lg);background:#1b1c20;padding:24px;display:flex;justify-content:center;align-items:center;min-height:250px;">
+  <div style="text-align:center;">
+    <svg viewBox="0 0 24 24" width="200" height="200" role="img" aria-label="Decoupled noise and confidence mic equalizer">
+      <defs><clipPath id="tt"><rect x="0.6" y="0.6" width="22.8" height="22.8" rx="5"></rect></clipPath></defs>
+      <rect x="0.6" y="0.6" width="22.8" height="22.8" rx="5" fill="#060607"></rect>
+      <g id="px" clip-path="url(#tt)" shape-rendering="crispEdges"></g>
+      <g id="icon" fill="none" stroke="#ff2e3a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 5 a3 3 0 0 1 6 0 v6 a3 3 0 0 1 -6 0 z"></path><path d="M6 12 a6 6 0 0 0 12 0"></path><line x1="12" y1="18" x2="12" y2="20.6"></line><line x1="8.6" y1="20.7" x2="15.4" y2="20.7"></line>
+      </g>
+    </svg>
+    <div id="cap" style="margin-top:10px;font-size:12px;color:#8a8c94;font-family:var(--font-mono);">e85 n12 c96 spec</div>
+    <div id="read" style="margin-top:4px;font-size:12px;color:#6c6e78;">locked on - understood</div>
+  </div>
+</div>
+
+<style>.sc,#spec,#snap{font-size:12px;padding:4px 9px;}.sc.on,#spec.on{border-color:var(--color-border-primary);background:var(--color-background-secondary);font-weight:500;}</style>
+
+<script>
+(function(){
+  var NS='http://www.w3.org/2000/svg';
+  var energyEl=document.getElementById('energy'),noiseEl=document.getElementById('noise'),confEl=document.getElementById('conf'),spec=document.getElementById('spec'),snapBtn=document.getElementById('snap'),icon=document.getElementById('icon'),px=document.getElementById('px'),cap=document.getElementById('cap'),read=document.getElementById('read');
+  var RED=[255,59,48],BLUE=[46,123,255],PUR=[122,63,240],GRAY=[120,120,130],REC=[255,46,58];
+  var X0=1.0,Y0=1.0,W=22,H=22,pitch=1.2,bp=0.52,burn=0.2;
+  var cols=18,rows=18,cells=[],ph=[],fr=[],iw=[],ipa=[],gph=[],gfr=[],cgph=[],hgt=[];
+  var E=0.85,Ntar=0.12,Ctar=0.96,finalState=false;
+  function rgb(a){return 'rgb('+Math.round(a[0])+','+Math.round(a[1])+','+Math.round(a[2])+')';}
+  function lerp(a,b,t){return [a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];}
+  function spectrum(f){return f<=bp?lerp(RED,BLUE,f/bp):lerp(BLUE,PUR,(f-bp)/(1-bp));}
+  function cl(v,a,b){return v<a?a:(v>b?b:v);}
+  function build(){
+    cols=Math.floor(W/pitch);rows=Math.floor(H/pitch);
+    var cw=W/cols,ch=H/rows,sz=Math.min(cw,ch)*0.84;cells=[];ph=[];fr=[];iw=[];ipa=[];gph=[];gfr=[];cgph=[];hgt=[];px.innerHTML='';
+    for(var c=0;c<cols;c++){cells[c]=[];ph[c]=[];fr[c]=[];gph[c]=[];gfr[c]=[];iw[c]=1.4+Math.random()*2.4;ipa[c]=Math.random()*6.28;cgph[c]=Math.random()*6.28;hgt[c]=0;
+      for(var row=0;row<rows;row++){var r=document.createElementNS(NS,'rect');
+        r.setAttribute('x',(X0+c*cw+(cw-sz)/2).toFixed(3));r.setAttribute('y',(Y0+row*ch+(ch-sz)/2).toFixed(3));
+        r.setAttribute('width',sz.toFixed(3));r.setAttribute('height',sz.toFixed(3));r.setAttribute('stroke','#000');r.setAttribute('stroke-width','0.08');r.setAttribute('opacity','0');
+        px.appendChild(r);var b=rows-1-row;cells[c][b]=r;ph[c][b]=Math.random()*6.28;fr[c][b]=6+Math.random()*9;gph[c][b]=Math.random()*6.28;gfr[c][b]=0.5+Math.random()*1.1;}
+    }
+  }
+  function setSpec(on){finalState=!on;spec.classList.toggle('on',on);spec.textContent=on?'Speculative':'Final';caption();}
+  function caption(){
+    var line;if(Ctar>0.72)line=Ntar>0.6?'noisy room - still got you':'locked on - understood';else if(Ctar>0.4)line='parsing - not sure';else line=Ntar>0.6?'noise winning - lost you':'clear audio - cant parse';
+    cap.textContent='e'+Math.round(E*100)+' n'+Math.round(Ntar*100)+' c'+Math.round(Ctar*100)+' '+(finalState?'final':'spec');read.textContent=line;
+  }
+  document.querySelectorAll('.sc').forEach(function(b){b.onclick=function(){E=+b.dataset.e;Ntar=+b.dataset.n;Ctar=+b.dataset.c;energyEl.value=E;noiseEl.value=Ntar;confEl.value=Ctar;document.querySelectorAll('.sc').forEach(function(x){x.classList.toggle('on',x===b);});caption();};});
+  energyEl.oninput=function(){E=+energyEl.value;caption();};
+  noiseEl.oninput=function(){Ntar=+noiseEl.value;caption();};
+  confEl.oninput=function(){Ctar=+confEl.value;caption();};
+  spec.onclick=function(){setSpec(finalState);};
+  var snapStart=-9;snapBtn.onclick=function(){snapStart=NOW;};
+
+  var c=0.96,e=0.85,nz=0.12,NOW=0,lastAuto=0;
+  function tick(ts){
+    var t=ts/1000;NOW=t;
+    e+=(E-e)*0.18;c+=(Ctar-c)*0.08;nz+=(Ntar-nz)*0.1;
+    if(!finalState && t-lastAuto>2.4){snapStart=t;lastAuto=t;}
+    var sp=(t-snapStart)/0.13,inSnap=sp>=0&&sp<1;
+    var gap=cl(1-c,0,1);if(inSnap)gap*=(1-sp);
+    var dsat=gap*0.6;
+    for(var col=0;col<cols;col++){
+      var organized=Math.sin(t*2*Math.PI*1.3+col*0.62);
+      var disorg=Math.sin(t*iw[col]+ipa[col])*0.7+Math.sin(t*iw[col]*2.3+col*1.7)*0.3;
+      var m=(1-nz)*organized+nz*disorg;
+      var swing=(0.5+0.5*m)*(0.72+nz*0.55);
+      var target=cl(e*(0.42+0.6*swing),0,1);
+      var rate=inSnap?0:(0.16+0.5*nz);
+      hgt[col]+=(target-hgt[col])*rate;
+      var lit=Math.round(hgt[col]*rows);
+      if(gap>0.25){var cb=0.5+0.5*Math.sin(t*0.6+cgph[col]);if(cb<gap*0.5)lit=Math.floor(lit*(0.3+0.35*cb));}
+      for(var b=0;b<rows;b++){var cell=cells[col][b];
+        if(b<lit){
+          if(gap>0.05){var gv=0.5+0.5*Math.sin(t*gfr[col][b]+gph[col][b]);if(gv<gap*0.72){cell.setAttribute('opacity','0.04');continue;}}
+          var base=(b===lit-1)?PUR:spectrum(rows>1?b/(rows-1):0);
+          cell.setAttribute('fill',rgb(lerp(base,GRAY,dsat)));
+          var fl=0.5+0.5*Math.sin(t*fr[col][b]+ph[col][b]);
+          cell.setAttribute('opacity',cl(1-burn+burn*fl,0.25,1).toFixed(3));
+        }else cell.setAttribute('opacity','0');
+      }
+    }
+    var breathe=cl(0.78-c,0,0.5)*cl((c-0.28)/0.22,0,1)*0.05*Math.sin(t*2*Math.PI*0.55);
+    var wobA=cl((0.42-c)/0.42,0,1);
+    var wx=wobA*0.32*Math.sin(t*5.3)*Math.sin(t*2.1+1),wy=wobA*0.30*Math.sin(t*4.1+2)*Math.sin(t*1.7);
+    var sc=1+breathe;if(inSnap){wx*=(1-sp);wy*=(1-sp);sc=1-0.05*Math.sin(sp*Math.PI);}
+    icon.setAttribute('transform','translate('+(12+wx).toFixed(3)+' '+(12+wy).toFixed(3)+') scale('+sc.toFixed(4)+') translate(-12 -12)');
+    var micSat=(1-c)*0.55;if(inSnap)micSat*=(1-sp);
+    icon.setAttribute('stroke',rgb(lerp(REC,GRAY,micSat)));
+    icon.setAttribute('opacity',cl(0.58+0.42*c+(inSnap?0.2:0),0,1).toFixed(3));
+    requestAnimationFrame(tick);
+  }
+  build();setSpec(true);requestAnimationFrame(tick);
+})();
+</script>

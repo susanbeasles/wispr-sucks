@@ -18,22 +18,34 @@ enum TriggerAction: CustomStringConvertible {
     case todo(String)                                    // "todo …" → append to task list
     case runWorkflow(WorkflowBinding, input: String)     // user-defined Automator workflow
 
+    // Content-free on purpose: this is logged on every utterance via
+    // NSLog("classified -> \(action)"), and that NSLog stream is redirected to a
+    // plaintext, unencrypted ~/Library/Logs/SonarDictate.log. Interpolating the
+    // transcript body here put the first 40 chars of every dictation into that
+    // file in cleartext (PHI at rest). Log only the route and the body LENGTH -
+    // never the spoken words. Trigger verbs / target / workflow names are config
+    // labels chosen by the user, not dictation content, so they stay.
     var description: String {
         switch self {
-        case .dictate(let t):           return "dictate(\(t.prefix(40))…)"
-        case .action(let v, let b):     return "action(verb=\(v), body=\(b.prefix(40))…)"
-        case .llmPrompt(let t, let b):  return "llmPrompt(target=\(t), body=\(b.prefix(40))…)"
-        case .note(let b):              return "note(\(b.prefix(40))…)"
-        case .todo(let b):              return "todo(\(b.prefix(40))…)"
-        case .runWorkflow(let b, let i): return "runWorkflow(name=\(b.name), trigger=\(b.triggerPhrase), input=\(i.prefix(40))…)"
+        case .dictate(let t):            return "dictate(len=\(t.count))"
+        case .action(let v, let b):      return "action(verb=\(v), bodyLen=\(b.count))"
+        case .llmPrompt(let t, let b):   return "llmPrompt(target=\(t), bodyLen=\(b.count))"
+        case .note(let b):               return "note(len=\(b.count))"
+        case .todo(let b):               return "todo(len=\(b.count))"
+        case .runWorkflow(let b, let i): return "runWorkflow(name=\(b.name), trigger=\(b.triggerPhrase), inputLen=\(i.count))"
         }
     }
 }
 
 struct TriggerRouter {
-    // Built-in trigger vocabulary. User-defined workflow bindings (from
-    // WorkflowStore) take precedence — they're matched first.
-    static let defaultTriggers: Set<String> = ["yo", "claude", "cursor", "note", "todo", "jira"]
+    // Built-in trigger words are DISABLED. The user dictates naturally - often
+    // starting with "yo" - and routing those to action/note/todo handlers got in
+    // the way for zero benefit: the handlers are unwired and already fell back to
+    // plain dictation. Empty set => classify() treats every utterance as plain
+    // dictation, so leading "yo"/"note"/etc. land as ordinary words. User-defined
+    // workflow bindings (WorkflowStore) are unaffected; they are matched
+    // separately and only fire when the user explicitly binds a phrase.
+    static let defaultTriggers: Set<String> = []
 
     static func classify(
         _ transcript: String,
