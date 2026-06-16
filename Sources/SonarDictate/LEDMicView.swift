@@ -33,6 +33,7 @@ final class LEDMicView: NSView {
     private var e = 0.0, c = 1.0, nz = 0.12
     private var E = 0.0, Ctar = 1.0, Ntar = 0.12
     private var prevCtar = 1.0, ePrev = 0.0
+    private var wasLow = false   // confidence dipped low; arms the recovery bloom on the way back up
 
     // event clocks (seconds, CACurrentMediaTime)
     private var tNow = 0.0
@@ -42,6 +43,11 @@ final class LEDMicView: NSView {
     private var lastSnapSeen = 0.0
 
     private var timer: Timer?
+
+    // Precomputed per-row base spectrum color (static; depends only on the row).
+    // Flat scalar arrays so the per-cell hot path never allocates a [Double].
+    private var rowR = [Double](), rowG = [Double](), rowB = [Double]()
+    private let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -75,20 +81,31 @@ final class LEDMicView: NSView {
             for _ in 0..<rows { p.append(rnd()*6.28); f.append(6 + rnd()*9); r.append(rnd()); g.append(rnd()*6.28) }
             ph.append(p); fr.append(f); rm.append(r); gp.append(g)
         }
+        rowR = []; rowG = []; rowB = []
+        for b in 0..<rows {
+            let s = spectrum(rows > 1 ? Double(b)/Double(rows-1) : 0)
+            rowR.append(s[0]); rowG.append(s[1]); rowB.append(s[2])
+        }
     }
 
-    // Map raw RMS (~0.005..0.3 speech) to the mockup's 0..1 energy.
+    // Map raw RMS to the 0..1 energy that drives bar height. Boosted gain +
+    // lower noise floor so normal speech climbs the bars instead of barely
+    // creeping off the bottom. (Tune `gain` up/down for more/less sensitivity.)
     private func energyCurve(_ rms: Float) -> Double {
         let r = Double(rms)
-        if r < 0.004 { return 0 }
-        return min(1, sqrt(r) * 2.2)
+        if r < 0.0015 { return 0 }
+        // Soft compression instead of a hard cap. Quiet speech still climbs well,
+        // but loud input (and music) keeps moving near the top instead of slamming
+        // flat - the EQ stays dynamic across volumes rather than pegging solid.
+        let g = sqrt(r) * 3.2
+        return min(1, g / (1 + g * 0.6))
     }
 
     // MARK: - Lifecycle (RecordingOverlay show/hide)
 
     func beginListening() {
         idle = false; releasing = false
-        prevCtar = 1; for i in 0..<hgt.count { hgt[i] = 0 }
+        prevCtar = 1; wasLow = false; for i in 0..<hgt.count { hgt[i] = 0 }
         startTimer()
     }
 
@@ -109,6 +126,8 @@ final class LEDMicView: NSView {
 
     private func startTimer() {
         if timer != nil { return }
+        // 60fps for the smooth EQ. The per-frame cost is now allocation-free (see
+        // draw): scalar color math + raw component fills, no CGColor/array churn.
         let t = Timer(timeInterval: 1.0/60.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -135,14 +154,19 @@ final class LEDMicView: NSView {
             snapStart = t; lastSnapSeen = s.lastSnapAt
         }
         // confidence climbing sharply -> heel bloom (recovery)
-        if !releasing, Ctar - prevCtar > 0.18 { recStart = t }
+        // Recovery bloom on a real low->high climb (not a per-frame delta, which
+        // the gradual proxy never produced - that's why recovery "wouldn't come
+        // back"). Arm when confidence dips low, fire the white heel when it climbs
+        // back up.
+        if Ctar < 0.4 { wasLow = true }
+        if !releasing, wasLow, Ctar > 0.7 { recStart = t; wasLow = false }
         prevCtar = Ctar
 
         e += (E - e) * 0.18
         c += (Ctar - c) * 0.08
         nz += (Ntar - nz) * 0.1
 
-        let reP = (t - relStart) / 1.9
+        let reP = (t - relStart) / 1.3
         let inRel = releasing && reP >= 0 && reP < 1
         if releasing, reP >= 1 { releasing = false; idle = true }
 
@@ -155,8 +179,21 @@ final class LEDMicView: NSView {
             hgt[col] += (target - hgt[col]) * ((inRel || idle) ? 0 : (0.16 + 0.5*nz))
         }
 
-        needsDisplay = true
-        if idle { stopTimer() }   // settle on a static black frame
+        // Only trigger the expensive 324-cell redraw when something is actually
+        // visible or animating. Don't burn the draw on silence or a fully-decayed
+        // frame. The cheap per-column math above still runs every tick so we catch
+        // the instant speech returns (no lag), but the draw is skipped when there
+        // is nothing to show.
+        if idle {
+            needsDisplay = true   // one final frame: the powered-down black tile
+            stopTimer()
+            return
+        }
+        let recActive = (t - recStart) < 0.6
+        let snapActive = (t - snapStart) < 0.13
+        var anyLit = false
+        for col in 0..<cols where hgt[col] * Double(rows) >= 0.5 { anyLit = true; break }
+        needsDisplay = releasing || recActive || snapActive || anyLit
     }
 
     // MARK: - Draw
@@ -181,15 +218,17 @@ final class LEDMicView: NSView {
         // derived timing (mirror the mockup's tick)
         let rP = (t - recStart) / 0.6
         let rec = (rP >= 0 && rP < 1) ? sin(rP * .pi) : 0
-        let reP = (t - relStart) / 1.9
+        let reP = (t - relStart) / 1.3
         let inRel = releasing && reP >= 0 && reP < 1
         let pwr = releasing ? (reP < 0.4 ? 1.0 : cl(1 - (reP-0.4)/0.5, 0, 1)) : (idle ? 0.0 : 1.0)
         let snP = (t - snapStart) / 0.13
         let inSnap = snP >= 0 && snP < 1 && !idle && !releasing
         var gap = cl(1 - c, 0, 1); if inSnap { gap *= (1 - snP) }; gap *= (1 - rec)
-        let dsat = gap * 0.55, whiteMix = rec * 0.42
-        let fdepth = cl((gap - 0.12)/0.7, 0, 1)
-        let missCh = gap > 0.5 ? (gap - 0.5)*0.5 : 0
+        // Stronger degradation: more desaturation, flicker kicks in earlier, and
+        // missing black squares start sooner and appear more often when unsure.
+        let dsat = gap * 0.78, whiteMix = rec * 0.42
+        let fdepth = cl((gap - 0.08)/0.6, 0, 1)
+        let missCh = gap > 0.35 ? (gap - 0.35)*0.7 : 0
 
         // tile background #060607, clip pixels to it
         let bg = R(0.6, 0.6, 22.8, 22.8)
@@ -208,10 +247,18 @@ final class LEDMicView: NSView {
             }
         }
 
-        // pixels
+        // pixels - ALLOCATION-FREE hot path. The old code allocated a CGColor plus
+        // a couple of [Double] arrays (Lc/spectrum) PER CELL PER FRAME - hundreds of
+        // heap allocations every frame, the resource hog. Here the colorspace is set
+        // once, the color math is inlined to scalars, and raw components are fed to a
+        // single reused buffer. Output is byte-identical to the mockup.
         ctx.saveGState()
         ctx.addPath(bgPath); ctx.clip()
-        let cw = WD/Double(cols), ch = HT/Double(rows), sz = min(cw, ch) * 0.84
+        ctx.setFillColorSpace(srgbSpace)
+        var comps: [CGFloat] = [0, 0, 0, 1]
+        // 0.95: big squares that nearly fill their slot, only a thin black grid
+        // line between them. Fills the tile instead of tiny dots lost in black.
+        let cw = WD/Double(cols), ch = HT/Double(rows), sz = min(cw, ch) * 0.95
         for col in 0..<cols {
             let lit = Int((hgt[col] * Double(rows)).rounded())
             if lit <= 0 || pwr <= 0.001 { continue }
@@ -222,13 +269,19 @@ final class LEDMicView: NSView {
                 let cy = Y0 + Double(row)*ch + (ch - sz)/2
                 let rect = R(cx, cy, sz, sz)
                 if missCh > 0 && rm[col][b] < missCh && (0.5 + 0.5*sin(t*0.9 + gp[col][b])) < 0.55 {
-                    ctx.setFillColor(mkColor(WHITE, 0.04*pwr)); ctx.fill(rect); continue
+                    comps[0] = 1; comps[1] = 1; comps[2] = 1; comps[3] = CGFloat(0.04*pwr)
+                    ctx.setFillColor(comps); ctx.fill(rect); continue
                 }
-                let base = (b == lit-1) ? PUR : spectrum(rows > 1 ? Double(b)/Double(rows-1) : 0)
-                var color = Lc(base, GRAY, dsat); if whiteMix > 0 { color = Lc(color, WHITE, whiteMix) }
+                // base spectrum color (leading lit pixel is always purple = PUR)
+                var cr: Double, cg: Double, cb: Double
+                if b == lit-1 { cr = 122; cg = 63; cb = 240 } else { cr = rowR[b]; cg = rowG[b]; cb = rowB[b] }
+                // desaturate toward GRAY [120,120,130], then recovery white-mix
+                cr += (120 - cr)*dsat; cg += (120 - cg)*dsat; cb += (130 - cb)*dsat
+                if whiteMix > 0 { cr += (255 - cr)*whiteMix; cg += (255 - cg)*whiteMix; cb += (255 - cb)*whiteMix }
                 let bfl = 0.5 + 0.5*sin(t*fr[col][b] + ph[col][b])
                 let op = cl((1 - burn + burn*bfl) * flick(t, gp[col][b]*3.1, inRel ? 0 : fdepth), 0.14, 1) * pwr
-                ctx.setFillColor(mkColor(color, op)); ctx.fill(rect)
+                comps[0] = CGFloat(cr/255); comps[1] = CGFloat(cg/255); comps[2] = CGFloat(cb/255); comps[3] = CGFloat(op)
+                ctx.setFillColor(comps); ctx.fill(rect)
             }
         }
         ctx.restoreGState()

@@ -38,10 +38,12 @@ final class WidgetSignals {
 
     private init() {}
 
-    // Realtime audio thread. Single store; never allocates.
+    // Realtime audio thread. MUST stay lock-free: a realtime thread blocking on a
+    // lock held by the 120x/sec main-thread LED reader can stall audio capture and
+    // drop buffers. A single Float store/load needs no lock here - a one-frame-stale
+    // value is imperceptible for a UI level, and energy is never read under the lock.
     func publishEnergy(_ rms: Float) {
-        let v = rms.isFinite ? max(0, rms) : 0
-        lock.lock(); energy = v; lock.unlock()
+        energy = rms.isFinite ? max(0, rms) : 0
     }
 
     // Speech results callback. Clamp to 0..1.
@@ -61,10 +63,10 @@ final class WidgetSignals {
     // white lock (high confidence) vs a hesitant gray power-down (low confidence).
     func setListening(_ on: Bool) {
         let now = CACurrentMediaTime()
+        if on { energy = 0 }   // lock-free field (see publishEnergy)
         lock.lock()
         if on {
             listening = true
-            energy = 0
             confidence = 1
             lastSnapAt = 0
             releaseAt = 0
@@ -78,10 +80,11 @@ final class WidgetSignals {
     }
 
     func snapshot() -> Snapshot {
+        let e = energy   // lock-free read (see publishEnergy)
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(
-            energy: energy,
+            energy: e,
             confidence: confidence,
             listening: listening,
             lastSnapAt: lastSnapAt,

@@ -6,17 +6,17 @@ import CoreMedia
 // Thin wrapper around macOS 26's SpeechAnalyzer + SpeechTranscriber.
 //
 // Why this exists vs. SFSpeechRecognizer:
-//   - Partial cadence ~50–100ms instead of 200–500ms (sub-network-RTT,
+//   - Partial cadence ~50-100ms instead of 200-500ms (sub-network-RTT,
 //     so we beat any cloud streaming product on perceived latency).
 //   - Native volatile/final result distinction via per-result CMTimeRange.
 //   - Apple ships the model on macOS 26+; nothing to install.
 //
-// AUDIO FORMAT (load-bearing — see git history): SpeechAnalyzer traps with
+// AUDIO FORMAT (load-bearing - see git history): SpeechAnalyzer traps with
 // EXC_BREAKPOINT inside preRunRecognition() if fed an incompatible PCM
 // format. The mic input node is typically 48kHz Float32; the transcriber
 // wants whatever bestAvailableAudioFormat reports. We negotiate that format
 // at start() and run every buffer through an AVAudioConverter before feeding
-// AnalyzerInput. Do NOT feed raw mic buffers directly — it crashes.
+// AnalyzerInput. Do NOT feed raw mic buffers directly - it crashes.
 
 @available(macOS 26.0, *)
 final class SpeechAnalyzerSession {
@@ -29,14 +29,14 @@ final class SpeechAnalyzerSession {
     private var analyzerTask: Task<Void, Never>?
     private var resultsTask: Task<Void, Never>?
 
-    // Audio format conversion: mic format → transcriber-compatible format.
+    // Audio format conversion: mic format -> transcriber-compatible format.
     private var converter: AVAudioConverter?
     private var analyzerFormat: AVAudioFormat?
 
     // Final (committed) transcript segments, keyed by range start (ms). Volatile
     // (in-progress) results are tracked SEPARATELY: mixing volatile + final in
     // one map doubled every phrase, because a volatile and its final can have
-    // range starts that jitter by ~1ms → different keys → both survive. Finals
+    // range starts that jitter by ~1ms -> different keys -> both survive. Finals
     // accumulate; only the latest volatile tail is kept and it never enters the
     // committed transcript.
     private var finalizedChunks: [Double: String] = [:]
@@ -48,17 +48,19 @@ final class SpeechAnalyzerSession {
     // empty - the log alone could not tell those apart. Written from the realtime
     // audio thread (append) and the results task; guarded by diagLock.
     private var fedBufferCount = 0
+    private var droppedBufferCount = 0
     private var resultCount = 0
     private var peakAmplitude: Float = 0
     private let diagLock = NSLock()
 
-    // LED widget confidence proxy: the recognizer's volatile-tail churn. A
-    // retracted (shortened) volatile guess reads as uncertainty; steady growth
-    // reads as confidence. Feeds the floating widget's integrity layer via
-    // WidgetSignals - it is NOT consumed by transcription. Written only from the
-    // serial results task (handle), so no lock needed. Replace with a real
-    // transcriptionConfidence read when that attribute is wired.
-    private var prevVolatileLen = 0
+    // LED widget confidence proxy: the recognizer's volatile-tail CHURN. When it
+    // is unsure it REWRITES earlier words (the new guess is not just the old one
+    // extended); when confident the volatile grows as a clean prefix-extension. A
+    // rewrite drops confidence hard so the widget cells visibly desaturate, flicker
+    // and drop black squares during mumbling; steady growth recovers it slowly.
+    // Feeds the widget integrity layer via WidgetSignals - NOT consumed by
+    // transcription. Written only from the serial results task (handle), no lock.
+    private var prevVolatileText = ""
     private var confProxy: Float = 1
 
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
@@ -82,7 +84,7 @@ final class SpeechAnalyzerSession {
         // start() was still negotiating the audio format), its input continuation
         // was never finished and its analyzer/results tasks hang forever. Two
         // overlapping SpeechAnalyzer instances corrupt the pipeline so the new
-        // session never emits a final result — which kills finalize()/broadcast.
+        // session never emits a final result - which kills finalize()/broadcast.
         // Cancelling here guarantees exactly one analyzer at a time.
         audioContinuation?.finish()
         audioContinuation = nil
@@ -140,7 +142,14 @@ final class SpeechAnalyzerSession {
             NSLog("SonarDictate: mic format already transcriber-compatible (\(Int(inputFormat.sampleRate))Hz)")
         }
 
-        let (audioStream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
+        // BOUNDED buffer (was the default .unbounded). The realtime tap yields ~21
+        // buffers/sec; if the analyzer stalls or falls behind on a long hold, an
+        // unbounded queue silently absorbs hundreds of buffers and the session ends
+        // having produced ZERO results (the long-dictation failure). 64 items is
+        // ~3s of slack - a healthy analyzer never reaches it (no drops, no behavior
+        // change for working sessions); a genuinely-stalled one drops buffers (which
+        // the new droppedBufferCount surfaces) instead of backlogging into silence.
+        let (audioStream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingNewest(64))
         self.audioContinuation = continuation
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -197,22 +206,47 @@ final class SpeechAnalyzerSession {
         guard let continuation = audioContinuation else { return }
         recordDiagnostics(for: buffer)
         guard let converter, let outFormat = analyzerFormat else {
-            // No conversion needed (formats matched) — feed directly.
-            continuation.yield(AnalyzerInput(buffer: buffer))
+            // No conversion needed (formats matched) - feed directly.
+            noteYield(continuation.yield(AnalyzerInput(buffer: buffer)))
             return
         }
         guard let converted = convert(buffer, with: converter, to: outFormat) else { return }
-        continuation.yield(AnalyzerInput(buffer: converted))
+        noteYield(continuation.yield(AnalyzerInput(buffer: converted)))
+    }
+
+    // Count buffers the bounded stream dropped (analyzer genuinely slower than
+    // realtime). fed high + dropped>0 => raise the buffer bound or the consumer is
+    // too slow; dropped=0 on a healthy long session proves the buffering fix holds.
+    private func noteYield(_ result: AsyncStream<AnalyzerInput>.Continuation.YieldResult) {
+        if case .dropped = result {
+            diagLock.lock(); droppedBufferCount += 1; diagLock.unlock()
+        }
     }
 
     func stop() {
+        // 0. Feed a short trailing SILENCE before ending input. The streaming
+        //    endpointer needs trailing low-energy audio to promote the genuinely-
+        //    last word from volatile to final; without it an abrupt key-release
+        //    truncated the last ~150-190ms of speech (final range ended early,
+        //    volLen=0). Yield it in the already-negotiated analyzer format (no
+        //    converter), zeroed so it reads as true silence. The analyzer consumes
+        //    input faster than realtime, so this adds compute time, not wall-clock.
+        if let continuation = audioContinuation, let fmt = analyzerFormat {
+            let frames = AVAudioFrameCount(fmt.sampleRate * 0.25)  // ~250ms
+            if let silence = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) {
+                silence.frameLength = frames
+                let abl = UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList)
+                for buf in abl { if let p = buf.mData { memset(p, 0, Int(buf.mDataByteSize)) } }
+                continuation.yield(AnalyzerInput(buffer: silence))
+            }
+        }
         // 1. Signal no-more-audio by finishing the input stream.
         audioContinuation?.finish()
         audioContinuation = nil
         // 2. Explicitly finalize the analyzer. THIS is load-bearing: finishing
         //    the input stream alone does NOT complete transcriber.results, so the
         //    resultsTask loop never ends and its final emitTranscript(isFinal:true)
-        //    never runs — which is why commit-at-end wrote nothing. finalizeAnd
+        //    never runs - which is why commit-at-end wrote nothing. finalizeAnd
         //    FinishThroughEndOfInput() flushes pending audio + promotes volatile
         //    results to final, completing the stream so the final transcript fires.
         let analyzer = self.analyzer
@@ -298,14 +332,21 @@ final class SpeechAnalyzerSession {
         // is proxied from volatile-tail churn; a non-empty final is a "snap" pulse.
         if result.isFinal {
             if !plain.isEmpty {
-                confProxy = min(1, confProxy + 0.1)
+                // A committed segment IS high confidence - snap it back up decisively
+                // so the cells recover (this is what makes "it comes back" reliable).
+                confProxy = min(1, max(confProxy + 0.2, 0.9))
+                prevVolatileText = ""
                 WidgetSignals.shared.publishConfidence(confProxy)
                 WidgetSignals.shared.snap()
             }
         } else {
-            let len = plain.count
-            confProxy = len < prevVolatileLen ? max(0.2, confProxy - 0.18) : min(1, confProxy + 0.04)
-            prevVolatileLen = len
+            // Rewrite of earlier words (new volatile is NOT the old one extended) =
+            // the recognizer is unsure -> drop confidence hard so the integrity look
+            // (desaturate + flicker + missing black squares) actually shows. Clean
+            // prefix-growth = confident -> recover (faster now so it doesn't stick low).
+            let revised = !prevVolatileText.isEmpty && !plain.hasPrefix(prevVolatileText)
+            confProxy = revised ? max(0.12, confProxy - 0.3) : min(1, confProxy + 0.07)
+            prevVolatileText = plain
             WidgetSignals.shared.publishConfidence(confProxy)
         }
 
@@ -325,8 +366,8 @@ final class SpeechAnalyzerSession {
                 self.volatileText = ""
             } else {
                 // Only the latest volatile matters. Each volatile result's text is
-                // the full guess for its (un-finalized) range, so replace — never
-                // append — the previous volatile.
+                // the full guess for its (un-finalized) range, so replace - never
+                // append - the previous volatile.
                 self.volatileText = plain
             }
         }
@@ -363,11 +404,12 @@ final class SpeechAnalyzerSession {
     private func resetDiagnostics() {
         diagLock.lock()
         fedBufferCount = 0
+        droppedBufferCount = 0
         resultCount = 0
         peakAmplitude = 0
         diagLock.unlock()
         // Results-task-owned LED proxy state; reset here (runs before resultsTask starts).
-        prevVolatileLen = 0
+        prevVolatileText = ""
         confProxy = 1
     }
 
@@ -410,9 +452,9 @@ final class SpeechAnalyzerSession {
     //   outcome=cancelled            => a fast re-press superseded this session
     private func logSessionDiagnostics(outcome: String) {
         diagLock.lock()
-        let fed = fedBufferCount, res = resultCount, peak = peakAmplitude
+        let fed = fedBufferCount, dropped = droppedBufferCount, res = resultCount, peak = peakAmplitude
         diagLock.unlock()
-        NSLog("SonarDictate: session diag [\(outcome)] - fed=\(fed) buffers, results=\(res), peakAmplitude=\(String(format: "%.4f", peak))")
+        NSLog("SonarDictate: session diag [\(outcome)] - fed=\(fed) buffers, dropped=\(dropped), results=\(res), peakAmplitude=\(String(format: "%.4f", peak))")
     }
 }
 

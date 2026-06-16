@@ -11,11 +11,11 @@ import Foundation
 // come later once the platform integration points are wired.
 
 enum TriggerAction: CustomStringConvertible {
-    case dictate(String)                                 // no trigger → inject as text
-    case action(verb: String, body: String)              // "yo …" → route to MCP gateway / action handler
-    case llmPrompt(target: String, body: String)         // "claude …", "cursor …" → strip trigger, inject body
-    case note(String)                                    // "note …" → save to notes vault
-    case todo(String)                                    // "todo …" → append to task list
+    case dictate(String)                                 // no trigger -> inject as text
+    case action(verb: String, body: String)              // "yo ..." -> route to MCP gateway / action handler
+    case llmPrompt(target: String, body: String)         // "claude ...", "cursor ..." -> strip trigger, inject body
+    case note(String)                                    // "note ..." -> save to notes vault
+    case todo(String)                                    // "todo ..." -> append to task list
     case runWorkflow(WorkflowBinding, input: String)     // user-defined Automator workflow
 
     // Content-free on purpose: this is logged on every utterance via
@@ -55,7 +55,7 @@ struct TriggerRouter {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .dictate(transcript) }
 
-        // User-defined workflow bindings win over built-in triggers — they
+        // User-defined workflow bindings win over built-in triggers - they
         // were explicitly chosen by this user, so prefer them.
         if let store = workflowStore, let binding = store.match(trimmed) {
             let lower = trimmed.lowercased()

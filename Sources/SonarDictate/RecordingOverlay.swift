@@ -25,11 +25,14 @@ final class RecordingOverlay {
     private static let posKey = "sonar-dictate.widget.topRight"
     private static let posXKey = "sonar-dictate.widget.topRight.x"
     private static let posYKey = "sonar-dictate.widget.topRight.y"
-    private static let idleSize = NSSize(width: 52, height: 40)
-    private static let listeningSize = NSSize(width: 480, height: 56)
+    // The widget IS the EQ square - one square in both states (dim when idle,
+    // alive when listening). No wider pill and no transcript bar that would frame
+    // the square with extra background around it.
+    private static let idleSize = NSSize(width: 56, height: 56)
+    private static let listeningSize = NSSize(width: 56, height: 56)
 
     private var window: DraggableWidgetWindow?
-    private var bg: NSVisualEffectView?
+    private var bg: NSView?
     private var led: LEDMicView?
     private var statusLabel: NSTextField?
     private var transcriptLabel: NSTextField?
@@ -105,7 +108,7 @@ final class RecordingOverlay {
         let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
         w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
         bg?.frame = NSRect(origin: .zero, size: size)
-        led?.frame = NSRect(x: (size.width - 36) / 2, y: (size.height - 36) / 2, width: 36, height: 36)
+        led?.frame = NSRect(origin: .zero, size: size)   // EQ fills the whole square
         led?.needsDisplay = true
         statusLabel?.isHidden = true
         transcriptLabel?.isHidden = true
@@ -120,11 +123,9 @@ final class RecordingOverlay {
         let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
         w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
         bg?.frame = NSRect(origin: .zero, size: size)
-        led?.frame = NSRect(x: 8, y: (size.height - 44) / 2, width: 44, height: 44)
-        statusLabel?.frame = NSRect(x: 46, y: 30, width: 110, height: 16)
-        statusLabel?.isHidden = false
-        transcriptLabel?.frame = NSRect(x: 46, y: 6, width: size.width - 60, height: 24)
-        transcriptLabel?.isHidden = false
+        led?.frame = NSRect(origin: .zero, size: size)   // EQ fills the whole square
+        statusLabel?.isHidden = true
+        transcriptLabel?.isHidden = true
         w.alphaValue = 1.0
         savePosition()
     }
@@ -182,14 +183,10 @@ final class RecordingOverlay {
         w.onDragEnd = { [weak self] in self?.savePosition() }
 
         let background = DragPassthroughEffectView(frame: NSRect(origin: .zero, size: size))
-        background.material = .hudWindow
-        background.blendingMode = .behindWindow
-        background.state = .active
-        // Force the dark variant so the pill is near-black (the LED tile reads
-        // washed out on the light-gray hudWindow). The mic tile draws its own
-        // #060607 background; this just darkens the surrounding pill.
-        background.appearance = NSAppearance(named: .darkAqua)
+        // Solid near-black matching the LED tile (#060607) - one cohesive dark
+        // surface, no translucent gray box around a black tile.
         background.wantsLayer = true
+        background.layer?.backgroundColor = CGColor(srgbRed: 6/255, green: 6/255, blue: 7/255, alpha: 1)
         background.layer?.cornerRadius = 14
         background.layer?.masksToBounds = true
         bg = background
@@ -240,7 +237,7 @@ final class RecordingOverlay {
 // and would otherwise swallow the click and block isMovableByWindowBackground -
 // the "I can't drag from the icon, only from outside it" bug. As a plain NSView,
 // this view allows window-background dragging, so the whole widget drags.
-final class DragPassthroughEffectView: NSVisualEffectView {
+final class DragPassthroughEffectView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         // Inside the widget -> us (draggable). Outside -> nil (pass through).
         return super.hitTest(point) == nil ? nil : self

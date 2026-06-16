@@ -97,8 +97,8 @@ final class Dictator {
     private var clipboardStash: [[String: Data]]?
     private var stashChangeCount: Int = -1
 
-    // Selector engine — the set of target fields a dictation broadcasts to.
-    // Built up by clicking fields while ⌥ is held (or ⌃⌥L for the focused
+    // Selector engine - the set of target fields a dictation broadcasts to.
+    // Built up by clicking fields while Option is held (or ControlOptionL for the focused
     // field). Persists until wiped. On release, the transcript writes to all.
     private let selector = SelectorEngine()
 
@@ -143,14 +143,14 @@ final class Dictator {
         let trusted = AXIsProcessTrustedWithOptions(opts)
         NSLog("SonarDictate: Accessibility trusted=\(trusted)")
         if !trusted {
-            NSLog("SonarDictate: System Settings → Privacy & Security → Accessibility → enable SonarDictate, then restart this app.")
+            NSLog("SonarDictate: System Settings -> Privacy & Security -> Accessibility -> enable SonarDictate, then restart this app.")
         }
 
         // Speech Recognition TCC permission is still required by SpeechAnalyzer.
         SFSpeechRecognizer.requestAuthorization { status in
             NSLog("SonarDictate: Speech auth status raw=\(status.rawValue)")
             guard status == .authorized else {
-                NSLog("SonarDictate: Speech permission NOT authorized. Grant in System Settings → Privacy & Security → Speech Recognition.")
+                NSLog("SonarDictate: Speech permission NOT authorized. Grant in System Settings -> Privacy & Security -> Speech Recognition.")
                 return
             }
             DispatchQueue.main.async { self.installMonitor() }
@@ -183,7 +183,7 @@ final class Dictator {
             }
         }
         // Separate keyDown monitor for the double-space commit gesture. We
-        // only ACT on it when the chip is showing pending text — so normal
+        // only ACT on it when the chip is showing pending text - so normal
         // double-spaces you type (sentence ends, etc.) do nothing unless a
         // captured chip is waiting to be dropped. We never store or inspect
         // any other keystroke; this watches the space keycode only.
@@ -201,17 +201,17 @@ final class Dictator {
 
             let ctrlOpt = event.modifierFlags.contains(.control) && event.modifierFlags.contains(.option)
 
-            // ⌃⌥L → add the focused field to the selector.
+            // ControlOptionL -> add the focused field to the selector.
             if ctrlOpt, event.keyCode == 37 {  // 37 = kVK_ANSI_L
                 if let label = self.selector.addFocused() {
                     NSLog("SonarDictate: + target '\(label)' (selector now \(self.selector.count))")
                     self.highlighter?.update(targets: self.selector.targets)
                 } else {
-                    NSLog("SonarDictate: ⌃⌥L — focused element not editable / already in set")
+                    NSLog("SonarDictate: ControlOptionL - focused element not editable / already in set")
                 }
                 return
             }
-            // ⌃⌥K → wipe the selector.
+            // ControlOptionK -> wipe the selector.
             if ctrlOpt, event.keyCode == 40 {  // 40 = kVK_ANSI_K
                 self.selector.wipe()
                 self.highlighter?.clear()
@@ -240,7 +240,7 @@ final class Dictator {
                 return
             }
 
-            // Double-space → commit the chip into the focused field (only
+            // Double-space -> commit the chip into the focused field (only
             // when a chip is actually showing; otherwise normal typing).
             guard event.keyCode == 49 else { return }   // 49 = kVK_Space
             guard self.chip?.isShowing == true else { return }
@@ -367,7 +367,7 @@ final class Dictator {
         // said recently in this app context. SpeechAnalyzer's AnalysisContext
         // takes a tagged-string map; we feed it via session.setContextualStrings().
         // Bias the recognizer toward the user's own vocabulary. The DICTIONARY
-        // comes first (curated + corrections — the signal that actually teaches
+        // comes first (curated + corrections - the signal that actually teaches
         // the right words), then RAG over past transcripts (useful, but half-blind:
         // it'll reinforce whatever it heard, errors included). Dedup, cap, feed.
         var bias = dictionary.terms(forContext: sessionAppContext, limit: 100)
@@ -385,7 +385,7 @@ final class Dictator {
 
         let format = engine.inputNode.outputFormat(forBus: 0)
         sessionFormat = format
-        // Remove any tap left over from a racy prior session before installing —
+        // Remove any tap left over from a racy prior session before installing -
         // AVAudioEngine throws if a bus already has a tap.
         engine.inputNode.removeTap(onBus: 0)
         engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
@@ -401,7 +401,7 @@ final class Dictator {
             }
         }
 
-        // session.start(inputFormat:) is async — it negotiates the transcriber-
+        // session.start(inputFormat:) is async - it negotiates the transcriber-
         // compatible audio format and builds the converter. The engine must NOT
         // start until that's done, or raw 48kHz mic buffers reach SpeechAnalyzer
         // before the converter exists and it traps in preRunRecognition().
@@ -413,7 +413,7 @@ final class Dictator {
                 // starting the engine now would orphan this session and corrupt
                 // the next one (the rapid start/stop race).
                 guard self.listening else {
-                    NSLog("SonarDictate: released before audio start finished — aborting session")
+                    NSLog("SonarDictate: released before audio start finished - aborting session")
                     self.session.stop()
                     self.engine.inputNode.removeTap(onBus: 0)
                     return
@@ -435,12 +435,18 @@ final class Dictator {
         // the overlapping-session drop where a long, fully-recognized dictation
         // vanished on release.
         finalPersisted = false
-        session.stop()
+        // Drain the LAST captured audio into the recognizer BEFORE signaling
+        // end-of-input. Stopping the engine + removing the tap FIRST means the
+        // final in-flight buffers still reach session.append() with the input
+        // continuation open; session.stop() then feeds a short trailing silence
+        // and finalizes. The OLD order finished the continuation first, so the
+        // last ~150-190ms of speech was discarded - the "drops my words off at
+        // the end" bug (volLen=0, final range ending ~180ms before release).
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
-        // The transcriber's results stream drains naturally after audio
-        // input is finished; its final emission triggers finalize() via
-        // handleTranscript(isFinal: true).
+        session.stop()
+        // The transcriber's results stream drains after end-of-input; its final
+        // emission triggers finalize() via handleTranscript(isFinal: true).
     }
 
     // Called from the SpeechAnalyzer session's onTranscriptUpdate callback,
@@ -484,10 +490,10 @@ final class Dictator {
 
     // Cheap classifier-prefix check used to decide whether to stream the
     // session into the focused app or buffer it silently. Returns:
-    //   .initial   — not enough signal yet (single-word partial, or empty)
-    //   .buffering — first word matches a built-in trigger or a workflow
+    //   .initial   - not enough signal yet (single-word partial, or empty)
+    //   .buffering - first word matches a built-in trigger or a workflow
     //                binding prefix (longest-prefix wins for workflows)
-    //   .streaming — first word is plain dictation; safe to stream
+    //   .streaming - first word is plain dictation; safe to stream
     private func decideMode(from partial: String) -> SessionMode {
         let trimmed = partial.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .initial }
@@ -501,8 +507,8 @@ final class Dictator {
         let first = String(words[0])
             .lowercased()
             .trimmingCharacters(in: CharacterSet.punctuationCharacters)
-        // Leading built-in trigger ("yo"/"claude"/"note"/"todo") → buffer so we
-        // don't live-type it. Otherwise stream from the very first word — waiting
+        // Leading built-in trigger ("yo"/"claude"/"note"/"todo") -> buffer so we
+        // don't live-type it. Otherwise stream from the very first word - waiting
         // for a second word would add a visible one-word lag to the typing feel.
         if TriggerRouter.defaultTriggers.contains(first) {
             return .buffering
@@ -534,10 +540,10 @@ final class Dictator {
         NSLog("SonarDictate: classified -> \(action)")
 
         // Route the result:
-        //   - plain dictation → commit (direct inject if a field is focused,
+        //   - plain dictation -> commit (direct inject if a field is focused,
         //     else park in the draggable chip for later double-space commit)
-        //   - workflow binding → fire it via automator, never inject text
-        //   - other triggers (yo/claude/note/todo) → log for now
+        //   - workflow binding -> fire it via automator, never inject text
+        //   - other triggers (yo/claude/note/todo) -> log for now
         switch action {
         case .dictate(let text):
             commitDictation(text)
@@ -711,7 +717,7 @@ final class Dictator {
         }
     }
 
-    // PCM buffer copy — the original buffer's storage is reused by the audio
+    // PCM buffer copy - the original buffer's storage is reused by the audio
     // engine, so we must clone the bytes to keep them.
     private func copy(of buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else {
@@ -783,9 +789,9 @@ final class Dictator {
     }
 
     // Routing priority:
-    //   1. Selector has targets → broadcast to ALL of them.
-    //   2. An editable field is focused → direct inject ("shoot for the stars").
-    //   3. Otherwise → park in the draggable chip.
+    //   1. Selector has targets -> broadcast to ALL of them.
+    //   2. An editable field is focused -> direct inject ("shoot for the stars").
+    //   3. Otherwise -> park in the draggable chip.
     private func commit(_ text: String) {
         if !selector.isEmpty {
             NSLog("SonarDictate: broadcasting \(text.count) chars to \(selector.count) target(s): \(selector.summary)")
@@ -834,11 +840,11 @@ final class Dictator {
     // Deliver text to one selector target via the reliable keystroke path.
     //
     // We learned the hard way that AX value-set is silently ignored by Electron/
-    // web inputs (Claude, ChatGPT, Cursor, web textareas) — React never sees the
+    // web inputs (Claude, ChatGPT, Cursor, web textareas) - React never sees the
     // change. So instead we do what a human does and what the single-field path
     // already proved fast: CLICK the exact point the user clicked (which focuses
     // the real input, even in Electron), let focus settle, then type. When there's
-    // no click point (a ⌃⌥L focused-add), fall back to AX setFocused.
+    // no click point (a ControlOptionL focused-add), fall back to AX setFocused.
     private func broadcast(to target: SelectorEngine.Target, text: String) {
         if let cocoa = target.clickPoint {
             clickAt(cocoaPoint: cocoa)
@@ -1069,7 +1075,7 @@ func runCLI(_ args: [String]) -> Never {
             } else {
                 let df = ISO8601DateFormatter()
                 for b in bindings {
-                    print("\(b.id)  \"\(b.triggerPhrase)\"  →  \(b.name)")
+                    print("\(b.id)  \"\(b.triggerPhrase)\"  ->  \(b.name)")
                     print("        path: \(b.workflowPath)")
                     print("        bound: \(df.string(from: b.registeredAt))")
                 }
@@ -1084,7 +1090,7 @@ func runCLI(_ args: [String]) -> Never {
             let path = rest[1]
             let name = rest.count > 2 ? rest[2] : nil
             let b = try workflows.register(triggerPhrase: phrase, workflowPath: path, name: name)
-            print("bound \(b.id): \"\(b.triggerPhrase)\" → \(b.name)")
+            print("bound \(b.id): \"\(b.triggerPhrase)\" -> \(b.name)")
             print("  path: \(b.workflowPath)")
         case "unbind":
             guard let idOrPhrase = rest.first else {
@@ -1105,7 +1111,7 @@ func runCLI(_ args: [String]) -> Never {
                 fputs("error: no binding matches '\(idOrPhrase)'\n", stderr)
                 exit(1)
             }
-            print("running '\(binding.name)' (\(binding.workflowPath))…")
+            print("running '\(binding.name)' (\(binding.workflowPath))...")
             let code = try workflows.execute(binding, input: input.isEmpty ? nil : input)
             print("exit \(code)")
 
@@ -1156,7 +1162,7 @@ func runCLI(_ args: [String]) -> Never {
             )
             print("inserted synthetic correction for recording_id=\(testRecId)")
 
-        // Personal dictionary — the learning substrate. Terms here bias the
+        // Personal dictionary - the learning substrate. Terms here bias the
         // recognizer toward the user's own vocabulary every session.
         case "dict":
             let sub = rest.first
@@ -1168,7 +1174,7 @@ func runCLI(_ args: [String]) -> Never {
                     print("\nadd terms with: sonar-dictate dict add \"<term or phrase>\"")
                 } else {
                     for e in items {
-                        let ctx = e.appContext.map { " · \($0)" } ?? ""
+                        let ctx = e.appContext.map { " - \($0)" } ?? ""
                         print(String(format: "%6.1f  ", e.weight) + "\(e.term)  [\(e.source)\(ctx)]")
                     }
                     print("\n(\(items.count) terms)")
@@ -1229,7 +1235,7 @@ func runCLI(_ args: [String]) -> Never {
               similar <text...>             top-5 past recordings by cosine similarity
               rag-reset                     drop the index (recordings stay; reindex next session)
 
-            dictionary (personalization — biases the recognizer to your words):
+            dictionary (personalization - biases the recognizer to your words):
               dict                          list dictionary terms by weight
               dict add "<term>"             add/reinforce a term
               dict rm "<term>"              remove a term

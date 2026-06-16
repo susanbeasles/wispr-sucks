@@ -1,9 +1,9 @@
 import Foundation
 import CryptoKit
 
-// On-device personal dictionary — the personalization moat. A growing, weighted
-// list of the terms THIS user cares about (their jargon, names, acronyms, and —
-// the high-value ones — their corrections) that biases the recognizer toward
+// On-device personal dictionary - the personalization moat. A growing, weighted
+// list of the terms THIS user cares about (their jargon, names, acronyms, and -
+// the high-value ones - their corrections) that biases the recognizer toward
 // getting their words right. This is the half that beats Wispr: not raw speed
 // (we already win that), but learning that never leaves the machine.
 //
@@ -15,7 +15,7 @@ import CryptoKit
 //
 // Weight ranks terms so the strongest signals (corrections, repeated use) survive
 // when we cap the contextual-bias list handed to the recognizer. Unlike the RAG
-// bias — which is half-blind and will happily reinforce a misheard word — the
+// bias - which is half-blind and will happily reinforce a misheard word - the
 // dictionary is curated/corrected, so it teaches the RIGHT terms.
 //
 // Stored encrypted under the same Secure Enclave key as the recordings
@@ -106,7 +106,7 @@ final class DictionaryStore {
         return true
     }
 
-    // Learn from a correction: the user changed `wrong` → `right`. The corrected
+    // Learn from a correction: the user changed `wrong` -> `right`. The corrected
     // term is a strong positive signal (the implicit thumbs-down made concrete),
     // so it lands with high weight. Called by the edit-capture loop (phase 2).
     func learnCorrection(from wrong: String, to right: String, appContext: String? = nil) {

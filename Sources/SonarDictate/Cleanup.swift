@@ -2,11 +2,11 @@ import Foundation
 import FoundationModels
 
 // Optional cleanup pass over a finalized transcript using Apple's on-device
-// Foundation Models (~3B). 100% on-device — no network, consistent with the
+// Foundation Models (~3B). 100% on-device - no network, consistent with the
 // rest of the app's thesis.
 //
 // Cleanup is OPT-IN per focused-app context. LLM clients (Cursor, Claude,
-// ChatGPT, Terminal) are deliberately NOT cleanup targets — raw transcript is
+// ChatGPT, Terminal) are deliberately NOT cleanup targets - raw transcript is
 // the correct input for an LLM prompt; punctuation/grammar cleanup there is
 // wasted latency and can mangle intent. Document + messaging apps (Notes,
 // Slack, Mail, Outlook, Notion) benefit from polished output, so those are the
@@ -19,7 +19,7 @@ import FoundationModels
 final class Cleanup {
 
     // Focused-app bundle IDs where dictation gets the cleanup pass. Anything
-    // not in this set stays raw (the default — which is what LLM prompting
+    // not in this set stays raw (the default - which is what LLM prompting
     // wants). Future: make this user-configurable + persisted in SecureStore.
     static let cleanupApps: Set<String> = [
         "com.apple.Notes",

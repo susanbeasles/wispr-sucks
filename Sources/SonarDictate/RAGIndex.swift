@@ -21,7 +21,7 @@ import CryptoKit
 //
 // Index storage: one encrypted JSON file (rag-index.enc) alongside the
 // recordings, under the same Secure Enclave key. Vectors are doubles.
-// For 10k recordings × 512 dims × 8 bytes ≈ 40MB on disk, fits easily
+// For 10k recordings x 512 dims x 8 bytes ~ 40MB on disk, fits easily
 // in memory.
 
 struct RAGEntry: Codable {
@@ -64,7 +64,7 @@ final class RAGIndex {
 
     init() throws {
         // Embedding model. macOS 14+ ships NLContextualEmbedding. Assets are
-        // provisioned opportunistically by the OS — we don't force a download
+        // provisioned opportunistically by the OS - we don't force a download
         // here; we just gate on `hasAvailableAssets` and gracefully no-op
         // until the system has the model loaded.
         guard let emb = NLContextualEmbedding(language: .english) else {
@@ -147,7 +147,7 @@ final class RAGIndex {
     // proper nouns, acronyms (caps), instance IDs, version strings, etc.
     // Cheap, dictionary-free, no NLTagger overhead.
     func vocabularyBias(forContext appContext: String?, k: Int = 8) throws -> [String] {
-        let hits = try query("", k: k, appContext: appContext)  // empty query → fall through to recent
+        let hits = try query("", k: k, appContext: appContext)  // empty query -> fall through to recent
         // For an empty query we get noisy similarity; just use the most-recent
         // entries in the scoped pool as the bias source.
         let scoped: [RAGEntry]

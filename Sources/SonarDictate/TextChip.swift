@@ -8,7 +8,7 @@ import AppKit
 //   - Appears at the bottom-center when a dictation finishes with no editable
 //     field focused (or when the user prefers always-chip).
 //   - Shows a short preview of the captured text.
-//   - Draggable anywhere on screen (mouse — so NOT click-through, unlike the
+//   - Draggable anywhere on screen (mouse - so NOT click-through, unlike the
 //     listening overlay).
 //   - Holds the full text; the Dictator reads .pendingText to commit it.
 //   - hide() clears it.
@@ -33,7 +33,7 @@ final class TextChip: NSObject {
         DispatchQueue.main.async {
             self.pendingText = text
             self.ensureWindow()
-            let preview = text.count > 60 ? String(text.prefix(57)) + "…" : text
+            let preview = text.count > 60 ? String(text.prefix(57)) + "..." : text
             self.label?.stringValue = preview
             self.countLabel?.stringValue = "\(text.count) chars - click to copy"
             self.window?.orderFront(nil)

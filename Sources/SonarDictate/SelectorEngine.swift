@@ -4,7 +4,7 @@ import ApplicationServices
 // Tracks the set of target fields a dictation broadcasts to.
 //
 // The user builds the set up by clicking fields while holding the dictation
-// key (or ⌃⌥L to add the focused field). The set PERSISTS until removed/wiped,
+// key (or ControlOptionL to add the focused field). The set PERSISTS until removed/wiped,
 // so you can set up your N agent inputs once and fire many prompts at all of
 // them. On dictation release, the Dictator writes the transcript to every
 // target via writeToLocked() (AX value-set, focus+inject fallback).
@@ -20,7 +20,7 @@ final class SelectorEngine {
         // The exact screen point (Cocoa, bottom-left) the user clicked to add
         // this target. This is the RELIABLE focus anchor: the captured AX
         // element is flaky in Electron/web apps (returns toolbar junk), but the
-        // click point is, by definition, on the real input. nil for ⌃⌥L adds
+        // click point is, by definition, on the real input. nil for ControlOptionL adds
         // (focused element, no click). Broadcast clicks here to focus, then types.
         let clickPoint: CGPoint?
     }
@@ -53,7 +53,7 @@ final class SelectorEngine {
         return addIfEditable(element, clickPoint: cocoa)
     }
 
-    // Add the currently system-focused element (⌃⌥L gesture).
+    // Add the currently system-focused element (ControlOptionL gesture).
     @discardableResult
     func addFocused() -> String? {
         let system = AXUIElementCreateSystemWide()
@@ -77,7 +77,7 @@ final class SelectorEngine {
         guard isEditable(element) else { return nil }
         // Dedup: click-adds by point proximity (two web inputs in the same app
         // can return the SAME flaky AX element, so element-equality would wrongly
-        // collapse them — the click point is what distinguishes them); focus-adds
+        // collapse them - the click point is what distinguishes them); focus-adds
         // by element identity.
         if let cp = clickPoint {
             if targets.contains(where: { t in
