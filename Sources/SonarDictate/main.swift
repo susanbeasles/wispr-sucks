@@ -117,6 +117,13 @@ final class Dictator {
 
     func bootstrap() {
         NSLog("SonarDictate: bootstrap() (engine=SpeechAnalyzer)")
+        // NOTE: tried engine.inputNode.setVoiceProcessingEnabled(true) for Apple
+        // Voice Isolation (music/noise suppression). It broke the capture pipeline -
+        // the changed input format corrupted the audio to the recognizer (constant
+        // degradation, empty finals, nothing saved or injected). Reverted. The
+        // one-call API does not drop cleanly into this engine/converter setup; if we
+        // revisit, it needs its own I/O configuration (and likely a connected output
+        // node for the echo-canceller), tested in isolation.
 
         // Wire session callbacks. SpeechAnalyzer gives us a single
         // "current best transcript so far" string after each result;
@@ -129,6 +136,12 @@ final class Dictator {
         session.onError = { error in
             NSLog("SonarDictate: speech session error: \(error)")
         }
+
+        // Compile the user's dictionary into a custom-vocabulary language model so
+        // the recognizer reliably prefers their jargon (the soft contextual-strings
+        // bias never stuck). Async (export + compile a beat after launch), reused
+        // across sessions; rebuilt via refreshVocabularyModel() when words change.
+        refreshVocabularyModel()
 
         // Chip click -> copy its text to the clipboard (stashing the original so
         // we can restore it after the user's next paste).
@@ -155,6 +168,15 @@ final class Dictator {
             }
             DispatchQueue.main.async { self.installMonitor() }
         }
+    }
+
+    // (Re)build the custom-vocabulary language model from the CURRENT dictionary.
+    // Called at launch and whenever the vocabulary changes (panel add, learned
+    // correction). Heavy + async, so it runs off the main path; the rebuilt model
+    // takes effect on the next dictation once it finishes compiling.
+    func refreshVocabularyModel() {
+        let terms = dictionary.terms(forContext: nil, limit: 500)
+        Task { await session.prepareVocabulary(terms) }
     }
 
     private func installMonitor() {
@@ -936,20 +958,40 @@ final class Dictator {
         // in stalled chunks ("two letters, hang, then the rest") or gets partially
         // dropped. A single Cmd-V delivers any length in one action, instantly.
         //
-        // The dictated text is left on the clipboard deliberately: restoring the
-        // previous contents on a timer would race a slow paste and could inject
-        // stale clipboard data into the user's field - a far worse failure than a
-        // clobbered clipboard. (Matches the chip path, which also does not restore.)
         let trusted = AXIsProcessTrusted()  // false => Accessibility missing; the paste keystroke is silently dropped
         let pb = NSPasteboard.general
+        // Snapshot the user's clipboard so we can put it back after the paste lands.
+        // Copy EVERY type into fresh items so images/RTF/files survive, not just text.
+        let saved: [NSPasteboardItem] = (pb.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types where item.data(forType: type) != nil {
+                copy.setData(item.data(forType: type)!, forType: type)
+            }
+            return copy
+        }
         pb.clearContents()
         guard pb.setString(text, forType: .string) else {
             NSLog("SonarDictate: pasteboard set failed - falling back to keystroke inject (\(text.count) chars)")
             injectByKeystroke(text)
             return
         }
+        let token = pb.changeCount
         NSLog("SonarDictate: inject \(text.count) chars via paste (AXtrusted=\(trusted))")
         postPaste()
+        // Restore the user's clipboard AFTER the paste is consumed. Delayed so we
+        // don't race a slow target reading the pasteboard (an early restore would
+        // make it paste the OLD contents - the reason this used to be left clobbered).
+        // Guarded by changeCount: only put the original back if our dictated text is
+        // still on the board (nothing copied since); if the user copied something in
+        // the gap, leave THAT alone. Deferred + async, so release->inject stays instant.
+        if !saved.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                let board = NSPasteboard.general
+                guard board.changeCount == token else { return }
+                board.clearContents()
+                board.writeObjects(saved)
+            }
+        }
     }
 
     // Synthesize Cmd-V. Command is pressed and released around V (rather than

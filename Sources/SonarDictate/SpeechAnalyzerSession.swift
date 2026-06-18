@@ -23,6 +23,12 @@ final class SpeechAnalyzerSession {
     private let locale: Locale
     private let context = AnalysisContext()
 
+    // Compiled custom-vocabulary language model (built once from the user's
+    // dictionary - see prepareVocabulary). Attached to the transcriber as a content
+    // hint so the recognizer RELIABLY prefers their jargon (contextual strings were
+    // too soft to ever stick). nil until built / if the build fails.
+    private var customModelConfig: SFSpeechLanguageModel.Configuration?
+
     private var transcriber: DictationTranscriber?
     private var analyzer: SpeechAnalyzer?
     private var audioContinuation: AsyncStream<AnalyzerInput>.Continuation?
@@ -51,17 +57,22 @@ final class SpeechAnalyzerSession {
     private var droppedBufferCount = 0
     private var resultCount = 0
     private var peakAmplitude: Float = 0
+    // Diagnostic: what real transcriptionConfidence values are we actually reading?
+    // confObs=0 => the attribute isn't populating (confidence stuck at default).
+    // confObs>0 with a high min => the model is overconfident even on garbage.
+    private var confObsCount = 0
+    private var confObsSum = 0.0
+    private var confObsMin = 1.0
+    private var confObsMax = 0.0
+    // How often the mid-word truncation guard fired this session (the recognizer
+    // committed a final that chopped letters off the word the user just saw, and
+    // we restored the fuller volatile). truncRestoreChars = total tail chars saved.
+    // Content-free: counts only, no transcript text. Proves the guard is working
+    // via `sonar-dictate logs` without inspecting any dictated content.
+    private var truncRestoreCount = 0
+    private var truncRestoreChars = 0
     private let diagLock = NSLock()
 
-    // LED widget confidence proxy: the recognizer's volatile-tail CHURN. When it
-    // is unsure it REWRITES earlier words (the new guess is not just the old one
-    // extended); when confident the volatile grows as a clean prefix-extension. A
-    // rewrite drops confidence hard so the widget cells visibly desaturate, flicker
-    // and drop black squares during mumbling; steady growth recovers it slowly.
-    // Feeds the widget integrity layer via WidgetSignals - NOT consumed by
-    // transcription. Written only from the serial results task (handle), no lock.
-    private var prevVolatileText = ""
-    private var confProxy: Float = 1
 
     var onTranscriptUpdate: (@Sendable (_ transcript: String, _ isFinal: Bool) -> Void)?
     var onError: (@Sendable (Error) -> Void)?
@@ -72,6 +83,48 @@ final class SpeechAnalyzerSession {
 
     func setContextualStrings(_ strings: [String]) {
         context.contextualStrings[.general] = strings
+    }
+
+    // Build a custom-vocabulary language model from the user's terms and compile it,
+    // so the recognizer reliably prefers their jargon. Best-effort + async (export +
+    // compile take a beat): runs once at launch (and again when the vocabulary
+    // changes). On success, customModelConfig is set and start() attaches it.
+    //
+    // DEDUPED: trims, drops empties, and removes case-insensitive duplicates so a
+    // phrase is never weighted more than once just for appearing twice.
+    func prepareVocabulary(_ rawTerms: [String]) async {
+        var seen = Set<String>()
+        let terms = rawTerms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0.lowercased()).inserted }
+        guard !terms.isEmpty else { customModelConfig = nil; return }
+
+        let dir = SecureStore.baseDir.appendingPathComponent("vocab", isDirectory: true)
+        let assetURL = dir.appendingPathComponent("vocab.bin")
+        let modelURL = dir.appendingPathComponent("vocab.lm")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let data = SFCustomLanguageModelData(locale: locale,
+                                                 identifier: "com.sonarmd.sonardictate.vocab",
+                                                 version: "1")
+            // High count = strong bias. count:10 was too weak to beat common
+            // homophones ("git" kept losing to "get"). Crank it so the user's jargon
+            // wins. (If this over-biases - normal "get" becoming "git" - dial down.)
+            for term in terms {
+                SFCustomLanguageModelData.PhraseCount(phrase: term, count: 200).insert(data: data)
+            }
+            try await data.export(to: assetURL)
+            let config = SFSpeechLanguageModel.Configuration(languageModel: modelURL)
+            try await SFSpeechLanguageModel.prepareCustomLanguageModel(for: assetURL,
+                                                                       configuration: config,
+                                                                       ignoresCache: false)
+            customModelConfig = config
+            NSLog("SonarDictate: custom vocabulary model ready (\(terms.count) terms)")
+        } catch {
+            customModelConfig = nil
+            NSLog("SonarDictate: custom vocabulary model build failed: \(error.localizedDescription)")
+        }
     }
 
     // Async because format negotiation (bestAvailableAudioFormat) is async and
@@ -98,11 +151,26 @@ final class SpeechAnalyzerSession {
         // DictationTranscriber instead of SpeechTranscriber: Apple ships two
         // recognizers in macOS 26. SpeechTranscriber is tuned for transcribing
         // recorded audio (meetings, podcasts). DictationTranscriber is tuned
-        // for the exact use case we have - live voice into text input. The
-        // .progressiveLongDictation preset gives the streaming-with-volatile-
-        // partials cadence (same shape as SpeechTranscriber's .progressive-
-        // Transcription) so the live preview UX is unchanged.
-        let transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
+        // for the exact use case we have - live voice into text input.
+        //
+        // Built from explicit options instead of the .progressiveLongDictation
+        // preset for ONE reason: the preset initializer cannot opt into
+        // attributeOptions, and we need .transcriptionConfidence to drive the
+        // widget's REAL confidence (the preset only gives volatile streaming).
+        // reportingOptions:[.volatileResults] reproduces the preset's live
+        // streaming-with-volatile-partials cadence (the live preview UX); the
+        // confidence attribute then rides on each result's text runs.
+        var hints: Set<DictationTranscriber.ContentHint> = []
+        if let cfg = customModelConfig {
+            hints.insert(.customizedLanguage(modelConfiguration: cfg))   // bias toward the user's jargon
+        }
+        let transcriber = DictationTranscriber(
+            locale: locale,
+            contentHints: hints,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults],
+            attributeOptions: [.transcriptionConfidence]
+        )
         self.transcriber = transcriber
 
         // Ensure the language model assets are installed for this locale. Without
@@ -322,6 +390,7 @@ final class SpeechAnalyzerSession {
 
     private func handle(result: DictationTranscriber.Result) {
         diagLock.lock(); resultCount += 1; diagLock.unlock()
+        WidgetSignals.shared.noteActivity()   // recognizer produced output -> not starving
         let plain = String(result.text.characters)
         let key = result.range.start.seconds.rounded(toMilliseconds: 3)
         // TEMP diagnostic (content-free): the raw result stream, to see whether
@@ -330,26 +399,30 @@ final class SpeechAnalyzerSession {
 
         // LED widget signals (additive; not consumed by transcription). Confidence
         // is proxied from volatile-tail churn; a non-empty final is a "snap" pulse.
-        if result.isFinal {
-            if !plain.isEmpty {
-                // A committed segment IS high confidence - snap it back up decisively
-                // so the cells recover (this is what makes "it comes back" reliable).
-                confProxy = min(1, max(confProxy + 0.2, 0.9))
-                prevVolatileText = ""
-                WidgetSignals.shared.publishConfidence(confProxy)
-                WidgetSignals.shared.snap()
-            }
-        } else {
-            // Rewrite of earlier words (new volatile is NOT the old one extended) =
-            // the recognizer is unsure -> drop confidence hard so the integrity look
-            // (desaturate + flicker + missing black squares) actually shows. Clean
-            // prefix-growth = confident -> recover (faster now so it doesn't stick low).
-            let revised = !prevVolatileText.isEmpty && !plain.hasPrefix(prevVolatileText)
-            confProxy = revised ? max(0.12, confProxy - 0.3) : min(1, confProxy + 0.07)
-            prevVolatileText = plain
-            WidgetSignals.shared.publishConfidence(confProxy)
+        // REAL confidence: average the recognizer's per-run transcriptionConfidence
+        // (0..1) over this result. This is the model's own certainty - NOT inferred
+        // from volatile churn. The old proxy dropped on every word rewrite, but a
+        // streaming recognizer rewrites constantly even on clean speech, so it
+        // yo-yoed into "severe lossy" during perfect dictation. Real confidence stays
+        // high for clean speech and only dips when the model is genuinely unsure.
+        var confSum = 0.0, confN = 0
+        for run in result.text.runs {
+            if let cv = run.transcriptionConfidence { confSum += cv; confN += 1 }
+        }
+        if confN > 0 {
+            let avg = confSum / Double(confN)
+            WidgetSignals.shared.publishConfidence(Float(avg))
+            diagLock.lock()
+            confObsCount += 1; confObsSum += avg
+            confObsMin = min(confObsMin, avg); confObsMax = max(confObsMax, avg)
+            diagLock.unlock()
+        }
+        if result.isFinal && !plain.isEmpty {
+            WidgetSignals.shared.snap()
         }
 
+        var didRestore = false
+        var restoredTail = 0
         chunksQueue.sync {
             if result.isFinal {
                 // An empty final must NOT wipe the volatile tail. DictationTranscriber
@@ -360,9 +433,39 @@ final class SpeechAnalyzerSession {
                 // shows empty" bug. An empty final carries no words to commit, so ignore
                 // it entirely and keep the live tail intact.
                 guard !plain.isEmpty else { return }
+                // Mid-word truncation guard. The recognizer sometimes commits a final
+                // that is a strict character PREFIX of the volatile tail the user just
+                // saw on screen - it heard the whole word (audio range is preserved)
+                // but emitted fewer letters ("github" shown, "githu" committed). When
+                // that happens, restore the fuller volatile so the trailing letters are
+                // not dropped. Gated tight so it only ever EXTENDS, never reinterprets:
+                //   - exact hasPrefix (no case/normalization games)
+                //   - the dropped remainder has NO space: it is the rest of the SAME
+                //     last word, not a distinct later word (a space means the final
+                //     deliberately dropped a separate token, e.g. a correct
+                //     "testing testing" -> "testing" collapse: keep the final)
+                //   - remainder is short (<=5): a longer no-space tail over a multi-
+                //     second utterance is a deliberate revision/URL/compound, not one
+                //     truncated word: keep the final
+                //   - the final ends mid-word (last char is a letter/digit): if it
+                //     already ends on a space or sentence punctuation, the tail is not
+                //     a truncated word: keep the final (punctuation/casing the finalize
+                //     adds is an improvement, leave it)
+                // Non-prefix finals (a real rewrite like "git" -> "get") fall straight
+                // through to `plain`, so this is a strict superset of the old behavior.
+                var committed = plain
+                if self.volatileText.hasPrefix(plain), let last = plain.last,
+                   last.isLetter || last.isNumber {
+                    let remainder = self.volatileText.dropFirst(plain.count)
+                    if !remainder.contains(" ") && remainder.count <= 5 {
+                        committed = self.volatileText
+                        didRestore = true
+                        restoredTail = remainder.count
+                    }
+                }
                 // Committed segment: store under its range and drop the volatile
                 // tail it supersedes - otherwise the in-progress copy doubles it.
-                self.finalizedChunks[key] = plain
+                self.finalizedChunks[key] = committed
                 self.volatileText = ""
             } else {
                 // Only the latest volatile matters. Each volatile result's text is
@@ -370,6 +473,15 @@ final class SpeechAnalyzerSession {
                 // append - the previous volatile.
                 self.volatileText = plain
             }
+        }
+        // Tally a guard fire OUTSIDE chunksQueue.sync so diagLock is never nested
+        // inside the chunks queue (lock-ordering safety). didRestore/restoredTail
+        // were set by the non-escaping sync closure above.
+        if didRestore {
+            diagLock.lock()
+            truncRestoreCount += 1
+            truncRestoreChars += restoredTail
+            diagLock.unlock()
         }
         emitTranscript(isFinal: false)
     }
@@ -407,10 +519,9 @@ final class SpeechAnalyzerSession {
         droppedBufferCount = 0
         resultCount = 0
         peakAmplitude = 0
+        confObsCount = 0; confObsSum = 0; confObsMin = 1; confObsMax = 0
+        truncRestoreCount = 0; truncRestoreChars = 0
         diagLock.unlock()
-        // Results-task-owned LED proxy state; reset here (runs before resultsTask starts).
-        prevVolatileText = ""
-        confProxy = 1
     }
 
     // Count one fed buffer and track the session's peak audio amplitude. Runs on
@@ -453,8 +564,11 @@ final class SpeechAnalyzerSession {
     private func logSessionDiagnostics(outcome: String) {
         diagLock.lock()
         let fed = fedBufferCount, dropped = droppedBufferCount, res = resultCount, peak = peakAmplitude
+        let cObs = confObsCount, cAvg = confObsCount > 0 ? confObsSum / Double(confObsCount) : 0
+        let cMin = confObsCount > 0 ? confObsMin : 0, cMax = confObsMax
+        let tRestore = truncRestoreCount, tChars = truncRestoreChars
         diagLock.unlock()
-        NSLog("SonarDictate: session diag [\(outcome)] - fed=\(fed) buffers, dropped=\(dropped), results=\(res), peakAmplitude=\(String(format: "%.4f", peak))")
+        NSLog("SonarDictate: session diag [\(outcome)] - fed=\(fed) buffers, dropped=\(dropped), results=\(res), peakAmplitude=\(String(format: "%.4f", peak)), confObs=\(cObs) confAvg=\(String(format: "%.3f", cAvg)) confMin=\(String(format: "%.3f", cMin)) confMax=\(String(format: "%.3f", cMax)) truncRestore=\(tRestore) restoredChars=\(tChars)")
     }
 }
 

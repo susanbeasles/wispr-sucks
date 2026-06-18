@@ -34,6 +34,8 @@ final class LEDMicView: NSView {
     private var E = 0.0, Ctar = 1.0, Ntar = 0.12
     private var prevCtar = 1.0, ePrev = 0.0
     private var wasLow = false   // confidence dipped low; arms the recovery bloom on the way back up
+    private var wasSilent = false   // a real pause happened; arms a bloom when speech resumes
+    private var silentSince = 0.0   // last time energy was clearly present
 
     // event clocks (seconds, CACurrentMediaTime)
     private var tNow = 0.0
@@ -94,18 +96,20 @@ final class LEDMicView: NSView {
     private func energyCurve(_ rms: Float) -> Double {
         let r = Double(rms)
         if r < 0.0015 { return 0 }
-        // Soft compression instead of a hard cap. Quiet speech still climbs well,
-        // but loud input (and music) keeps moving near the top instead of slamming
-        // flat - the EQ stays dynamic across volumes rather than pegging solid.
-        let g = sqrt(r) * 3.2
-        return min(1, g / (1 + g * 0.6))
+        // Soft compression instead of a hard cap. Gain set HIGH because the mic
+        // signal here is quiet (normal speech was only filling ~25%). Now normal
+        // speech fills most of the bars; loud peaks ride the top still wiggling
+        // (the compression asymptote) rather than slamming a dead-flat slab.
+        // (Raise `gain` for more sensitivity; raise the 0.5 for more headroom.)
+        let g = sqrt(r) * 14.0
+        return min(1, g / (1 + g * 0.5))
     }
 
     // MARK: - Lifecycle (RecordingOverlay show/hide)
 
     func beginListening() {
         idle = false; releasing = false
-        prevCtar = 1; wasLow = false; for i in 0..<hgt.count { hgt[i] = 0 }
+        prevCtar = 1; wasLow = false; wasSilent = false; for i in 0..<hgt.count { hgt[i] = 0 }
         startTimer()
     }
 
@@ -142,8 +146,22 @@ final class LEDMicView: NSView {
         let t = tNow
 
         if !releasing {
-            E = energyCurve(s.energy)
-            Ctar = Double(s.confidence)
+            let realE = energyCurve(s.energy)
+            // Confidence = the recognizer's REAL transcriptionConfidence, OVERRIDDEN
+            // by a starvation check (uses REAL energy, not the display baseline below,
+            // so a quiet pause doesn't falsely read as failure). If you're clearly
+            // talking but the recognizer hasn't produced a result for a while, drive
+            // confidence down - that's the "loud but nothing transcribes" case.
+            let realConf = Double(s.confidence)
+            let sinceResult = t - s.lastResultAt
+            var keepingUp = 1.0
+            if realE > 0.2 && s.lastResultAt > 0 {
+                keepingUp = cl(1 - (sinceResult - 1.0) / 1.5, 0, 1)   // 1s grace, fully starved by 2.5s
+            }
+            Ctar = min(realConf, keepingUp)
+            // Bars get a baseline floor while recording so the colors are MOVING the
+            // instant the widget grows - not dead for a second while audio warms up.
+            E = max(realE, 0.3)
         }
         // noise estimate from energy jitter (no acoustic-noise signal yet)
         let jitter = abs(E - ePrev); ePrev = E
@@ -166,7 +184,7 @@ final class LEDMicView: NSView {
         c += (Ctar - c) * 0.08
         nz += (Ntar - nz) * 0.1
 
-        let reP = (t - relStart) / 1.3
+        let reP = (t - relStart) / 0.6
         let inRel = releasing && reP >= 0 && reP < 1
         if releasing, reP >= 1 { releasing = false; idle = true }
 
@@ -218,7 +236,7 @@ final class LEDMicView: NSView {
         // derived timing (mirror the mockup's tick)
         let rP = (t - recStart) / 0.6
         let rec = (rP >= 0 && rP < 1) ? sin(rP * .pi) : 0
-        let reP = (t - relStart) / 1.3
+        let reP = (t - relStart) / 0.6
         let inRel = releasing && reP >= 0 && reP < 1
         let pwr = releasing ? (reP < 0.4 ? 1.0 : cl(1 - (reP-0.4)/0.5, 0, 1)) : (idle ? 0.0 : 1.0)
         let snP = (t - snapStart) / 0.13
@@ -286,9 +304,12 @@ final class LEDMicView: NSView {
         }
         ctx.restoreGState()
 
-        // mic glyph (over pixels), with confidence color + breathe/wobble
+        // mic glyph (over pixels), with confidence color + breathe/wobble.
+        // WHITE mic - red is now the recording border's job, so the glyph stays
+        // white to pop against it; it only grays out when the recognizer is unsure,
+        // and fades with pwr via micOp below.
         let micSat = (1 - c) * 0.55 * (1 - rec)
-        let stroke = Lc(WHITE, Lc(REC, GRAY, micSat), pwr)
+        let stroke = Lc(WHITE, GRAY, micSat)
         let activeOp = cl(0.58 + 0.42*c + rec*0.4, 0, 1)
         let micOp = 0.12 + (activeOp - 0.12)*pwr
         let breathe = cl(0.78 - c, 0, 0.5) * cl((c - 0.28)/0.22, 0, 1) * 0.05 * sin(t * 2 * .pi * 0.55) * pwr
@@ -311,9 +332,19 @@ final class LEDMicView: NSView {
         mic.move(to: P(12, 18)); mic.addLine(to: P(12, 20.6))                           // stem
         mic.move(to: P(8.6, 20.7)); mic.addLine(to: P(15.4, 20.7))                       // base
         ctx.addPath(mic)
-        ctx.setStrokeColor(mkColor(stroke, micOp)); ctx.setLineWidth(1.5*S)
+        ctx.setStrokeColor(mkColor(stroke, micOp)); ctx.setLineWidth(1.05*S)   // thinner glyph
         ctx.setLineCap(.round); ctx.setLineJoin(.round); ctx.strokePath()
         ctx.restoreGState()
+
+        // recording border: a RED rim that pulses on/off while listening, so you can
+        // see it's still capturing. It's replaced by the white lock ring on release.
+        if !releasing && !idle {
+            let pulse = 0.25 + 0.6 * (0.5 + 0.5 * sin(t * 3.6))   // ~0.25..0.85, on/off
+            ctx.addPath(ringPath)
+            ctx.setStrokeColor(mkColor(REC, pulse))
+            ctx.setLineWidth(0.6 * S); ctx.setLineCap(.round)
+            ctx.strokePath()
+        }
 
         // release lock ring (white when confident, muted/partial/stuttering when not)
         if inRel {
@@ -321,8 +352,11 @@ final class LEDMicView: NSView {
             let whiteAmt = cl((C - 0.32)/0.5, 0, 1)
             let lockColor = Lc(MUTE, WHITE, whiteAmt)
             let maxFill = 0.42 + C*0.58
-            let fp = cl(reP/0.24, 0, 1); let ez2 = 1 - pow(1-fp, 2)
-            let filled = (reP < 0.24 ? maxFill*ez2 : maxFill)
+            // White ring fills over the first 0.3 of the (now 0.6s) release arc, so
+            // it completes in ~0.18s - quick - then the overlay shrinks immediately.
+            let sweep = 0.3
+            let fp = cl(reP/sweep, 0, 1); let ez2 = 1 - pow(1-fp, 2)
+            let filled = (reP < sweep ? maxFill*ez2 : maxFill)
             let fade = reP < 0.55 ? 1.0 : cl(1 - (reP-0.55)/0.45, 0, 1)
             let stutter = 1 - (1-C)*(0.32*(0.5 + 0.5*sin(t*26)) + ((sin(t*47 + reP*9) > 0.5) ? 0.4 : 0))
             let op = (0.42 + 0.5*C) * 0.9 * fade * max(0.22, stutter)

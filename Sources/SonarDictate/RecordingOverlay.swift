@@ -25,10 +25,9 @@ final class RecordingOverlay {
     private static let posKey = "sonar-dictate.widget.topRight"
     private static let posXKey = "sonar-dictate.widget.topRight.x"
     private static let posYKey = "sonar-dictate.widget.topRight.y"
-    // The widget IS the EQ square - one square in both states (dim when idle,
-    // alive when listening). No wider pill and no transcript bar that would frame
-    // the square with extra background around it.
-    private static let idleSize = NSSize(width: 56, height: 56)
+    // The widget is a tiny SPECK at idle and GROWS (animated) into the full EQ
+    // square when you talk. Same square shape, small -> large.
+    private static let idleSize = NSSize(width: 16, height: 16)
     private static let listeningSize = NSSize(width: 56, height: 56)
 
     private var window: DraggableWidgetWindow?
@@ -36,6 +35,7 @@ final class RecordingOverlay {
     private var led: LEDMicView?
     private var statusLabel: NSTextField?
     private var transcriptLabel: NSTextField?
+    private var shrinkWork: DispatchWorkItem?   // delayed shrink-to-speck after release
 
     // Call ONCE at app launch. Creates the widget in its idle state at its
     // saved position (or upper-right of the main screen on first run) and
@@ -53,10 +53,9 @@ final class RecordingOverlay {
     // Called on fn-down.
     func show() {
         DispatchQueue.main.async {
+            self.shrinkWork?.cancel()   // a quick re-press keeps it grown
             self.ensureWindow()
-            self.applyListening()
-            self.transcriptLabel?.stringValue = ""
-            self.statusLabel?.stringValue = "Listening..."
+            self.applyListening()       // animated grow speck -> full square
             WidgetSignals.shared.setListening(true)
             self.led?.beginListening()
             self.window?.orderFront(nil)
@@ -68,11 +67,16 @@ final class RecordingOverlay {
     // fn-up. The widget stays visible (it's the user's persistent draggable icon).
     func hide() {
         DispatchQueue.main.async {
-            self.transcriptLabel?.stringValue = ""
-            self.statusLabel?.stringValue = ""
             WidgetSignals.shared.setListening(false)
             self.led?.endListening()
-            self.applyIdle()
+            // Stay full-size while the LED plays its release lock + power-down, THEN
+            // shrink back to the speck. Cancellable so a quick re-press keeps it big.
+            self.shrinkWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.applyIdle() }
+            self.shrinkWork = work
+            // ~0.2s = right as the white lock finishes filling (sweep completes
+            // ~0.18s into the release). Shrink starts the instant the white lands.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
         }
     }
 
@@ -99,33 +103,27 @@ final class RecordingOverlay {
 
     // MARK: - Layout
 
+    // Both states animate the WINDOW frame + alpha. BOTTOM-RIGHT anchored: the
+    // bottom edge (the floor) and the right edge stay put, so it grows UPWARD (and a
+    // little left), never downward. The LED autoresizes to fill, so its 24x24 design
+    // scales with the frame = the EQ grows/shrinks in place.
     private func applyIdle() {
         guard let w = window else { return }
-        // Anchor on the CURRENT top-right so the icon doesn't visually jump
-        // when we collapse from listening size.
-        let tr = NSPoint(x: w.frame.maxX, y: w.frame.maxY)
+        let br = NSPoint(x: w.frame.maxX, y: w.frame.minY)
         let size = Self.idleSize
-        let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
-        w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
-        bg?.frame = NSRect(origin: .zero, size: size)
-        led?.frame = NSRect(origin: .zero, size: size)   // EQ fills the whole square
+        let origin = NSPoint(x: br.x - size.width, y: br.y)
+        w.setFrame(NSRect(origin: origin, size: size), display: true, animate: true)
+        w.alphaValue = 0.7   // a dim but seeable speck
         led?.needsDisplay = true
-        statusLabel?.isHidden = true
-        transcriptLabel?.isHidden = true
-        w.alphaValue = 0.55   // subtle when not dictating
         savePosition()
     }
 
     private func applyListening() {
         guard let w = window else { return }
-        let tr = NSPoint(x: w.frame.maxX, y: w.frame.maxY)
+        let br = NSPoint(x: w.frame.maxX, y: w.frame.minY)
         let size = Self.listeningSize
-        let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
-        w.setFrame(NSRect(origin: origin, size: size), display: true, animate: false)
-        bg?.frame = NSRect(origin: .zero, size: size)
-        led?.frame = NSRect(origin: .zero, size: size)   // EQ fills the whole square
-        statusLabel?.isHidden = true
-        transcriptLabel?.isHidden = true
+        let origin = NSPoint(x: br.x - size.width, y: br.y)
+        w.setFrame(NSRect(origin: origin, size: size), display: true, animate: true)
         w.alphaValue = 1.0
         savePosition()
     }
@@ -134,14 +132,14 @@ final class RecordingOverlay {
 
     private func savePosition() {
         guard let w = window else { return }
-        let tr = NSPoint(x: w.frame.maxX, y: w.frame.maxY)
+        let br = NSPoint(x: w.frame.maxX, y: w.frame.minY)   // bottom-right is the stable anchor
         let d = UserDefaults.standard
         d.set(true, forKey: Self.posKey)
-        d.set(Double(tr.x), forKey: Self.posXKey)
-        d.set(Double(tr.y), forKey: Self.posYKey)
+        d.set(Double(br.x), forKey: Self.posXKey)
+        d.set(Double(br.y), forKey: Self.posYKey)
     }
 
-    private func loadOrDefaultTopRight() -> NSPoint {
+    private func loadOrDefaultBottomRight() -> NSPoint {
         let d = UserDefaults.standard
         if d.object(forKey: Self.posKey) != nil {
             let p = NSPoint(x: CGFloat(d.double(forKey: Self.posXKey)),
@@ -152,22 +150,23 @@ final class RecordingOverlay {
                 return p
             }
         }
-        return defaultTopRight()
+        return defaultBottomRight()
     }
 
-    private func defaultTopRight() -> NSPoint {
+    private func defaultBottomRight() -> NSPoint {
         if let s = NSScreen.main {
             let v = s.visibleFrame
-            return NSPoint(x: v.maxX - 24, y: v.maxY - 24)
+            // Leave headroom ABOVE the speck for the upward grow (listening height).
+            return NSPoint(x: v.maxX - 24, y: v.maxY - 24 - Self.listeningSize.height)
         }
-        return NSPoint(x: 1200, y: 800)
+        return NSPoint(x: 1200, y: 760)
     }
 
     private func ensureWindow() {
         if window != nil { return }
-        let tr = loadOrDefaultTopRight()
+        let br = loadOrDefaultBottomRight()
         let size = Self.idleSize
-        let origin = NSPoint(x: tr.x - size.width, y: tr.y - size.height)
+        let origin = NSPoint(x: br.x - size.width, y: br.y)
         let w = DraggableWidgetWindow(
             contentRect: NSRect(origin: origin, size: size),
             styleMask: [.borderless],
@@ -191,7 +190,8 @@ final class RecordingOverlay {
         background.layer?.masksToBounds = true
         bg = background
 
-        let ledView = LEDMicView(frame: NSRect(x: 0, y: 0, width: 36, height: 36))
+        let ledView = LEDMicView(frame: background.bounds)
+        ledView.autoresizingMask = [.width, .height]   // scales with the window grow/shrink
         background.addSubview(ledView)
         led = ledView
 
@@ -251,6 +251,11 @@ final class DraggableWidgetWindow: NSWindow {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
     var onDragEnd: (() -> Void)?
+
+    // Snappy grow/shrink: a short fixed resize duration (the default scales with
+    // size change and feels sluggish). Drives both the grow-on-talk and the fast
+    // shrink-on-release.
+    override func animationResizeTime(_ newFrame: NSRect) -> TimeInterval { 0.13 }
 
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)

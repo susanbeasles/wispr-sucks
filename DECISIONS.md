@@ -41,6 +41,15 @@ field instantly. Two things were breaking that and are fixed:
    restore - it races a slow paste and could inject stale data). Keystroke path
    kept as injectByKeystroke() fallback when the pasteboard can't be set.
 
+UPDATE 2026-06-15 (owner-requested): the clipboard IS now restored. inject()
+snapshots every pasteboard item/type before overwriting, pastes the dictation,
+then restores the original ~0.5s later - guarded by NSPasteboard.changeCount so
+it only restores when our dictated text is still on the board (if the user copied
+something in the gap, that is left alone). The restore is deferred + async, so it
+never blocks release->inject. The 0.5s delay avoids the race the original decision
+warned about (an early restore makes a slow target paste the OLD contents); the
+residual risk is only an app that reads the pasteboard later than 0.5s.
+
 2. commitDictation ran `await cleanup.clean()` (on-device LLM, ~seconds) BEFORE
    injecting in cleanup-target apps - a multi-second release hang. Cleanup is no
    longer allowed to block release; commitDictation injects the recognizer's
@@ -145,3 +154,47 @@ The visualization itself is peripheral: WidgetSignals.swift (thread-safe bus) an
 LEDMicView.swift (mic-shaped LED matrix; energy=bars+color, confidence=integrity,
 snap/release=lock), hosted by RecordingOverlay. Energy/confidence mapping and the
 release/lock animation are expected to be tuned live at true widget size.
+
+## 2026-06-18 - SEALED (owner-approved): mid-word truncation guard at finalize
+
+Reported regression: dictation intermittently "cuts off the last letters" of the
+final word (e.g. shows "github" live, commits "githu"). Diagnosed from the
+encrypted log over 3025 speech sessions (analysis script + a 4-agent verification
+pass):
+  - 12.4% (376/3025) of sessions committed a FINAL whose text is SHORTER than the
+    longest volatile the user already saw. Drop sizes cluster at 1-5 chars.
+  - The final's AUDIO range end >= the peak volatile's range end in 375/376 cases
+    (only 4/3025 sessions discard audio tail), and ZERO sessions dropped buffers.
+  - Conclusion: not lost audio and not a buffer drop. The recognizer hears the
+    whole word but its FORCED finalize commits a shorter PREFIX of its own peak
+    hypothesis. All 376 are single-segment (no multi-segment assembly artifact).
+
+Fix (SpeechAnalyzerSession.swift, handle(), final branch only): when a non-empty
+final arrives that is a strict character PREFIX of the current volatileText, and
+the dropped remainder (a) contains no space, (b) is <=5 chars, and (c) the final
+ends mid-word (last char is a letter/digit), commit volatileText instead of the
+truncated final. This is the deliberate, surprising part: we OVERRIDE the
+recognizer's own final in this narrow case because what the user SAW (the volatile)
+is the fuller, correct word. The guard is a strict superset of the old behavior -
+it diverges ONLY on a clean single-token forward-extension; a real rewrite
+("git" -> "get", not a prefix) or a whole-word collapse ("testing testing" ->
+"testing", space in remainder) falls through to the final unchanged.
+
+Why the caps (do not loosen without re-checking the log):
+  - no-space remainder: a space means a DISTINCT later word the final intentionally
+    dropped (correct collapse), not a truncated tail. Restoring it would re-inject
+    text the model deliberately removed.
+  - <=5 chars: a longer no-space tail over a multi-second utterance is a deliberate
+    revision / URL / compound, not one truncated English word. Caps the blast
+    radius of a prefix-shaped revision (e.g. "bilaterally" -> "bilateral") to one
+    short token. Accepted false negative: rare long single-word truncations
+    (">5 char tail") stay unfixed.
+  - ends-mid-word: if the final already ends on a space or sentence punctuation the
+    finalize ADDED, that is an improvement, not a truncation - leave it.
+
+Measurement: logSessionDiagnostics() now emits content-free `truncRestore=N
+restoredChars=M` (counts only, no transcript text) so `sonar-dictate logs` proves
+how often the guard fires and lets a follow-up baseline quantify precision. If a
+text-bearing (gated) log is ever added, the no-space/prefix predicates can be
+measured directly; the len-only log cannot separate truncation from a
+prefix-shaped revision per-session.

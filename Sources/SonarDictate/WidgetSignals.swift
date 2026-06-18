@@ -26,6 +26,7 @@ final class WidgetSignals {
         var lastSnapAt: CFTimeInterval     // 0 if never
         var releaseAt: CFTimeInterval      // 0 while listening; set on setListening(false)
         var releaseConfidence: Float       // confidence captured at the moment of release
+        var lastResultAt: CFTimeInterval   // last time the recognizer produced ANY result
     }
 
     private let lock = NSLock()
@@ -35,6 +36,7 @@ final class WidgetSignals {
     private var lastSnapAt: CFTimeInterval = 0
     private var releaseAt: CFTimeInterval = 0
     private var releaseConfidence: Float = 1
+    private var lastResultAt: CFTimeInterval = 0
 
     private init() {}
 
@@ -58,6 +60,14 @@ final class WidgetSignals {
         lock.lock(); lastSnapAt = now; lock.unlock()
     }
 
+    // The recognizer produced ANY result (volatile or final). Drives the
+    // starvation check: talking with no recent activity = the recognizer is
+    // failing, even though no low-confidence result ever arrives to show it.
+    func noteActivity() {
+        let now = CACurrentMediaTime()
+        lock.lock(); lastResultAt = now; lock.unlock()
+    }
+
     // Listening edges. On start: arm (energy 0, confident, clear release/snap).
     // On stop: stamp the release and capture confidence so the view can choose a
     // white lock (high confidence) vs a hesitant gray power-down (low confidence).
@@ -71,6 +81,7 @@ final class WidgetSignals {
             lastSnapAt = 0
             releaseAt = 0
             releaseConfidence = 1
+            lastResultAt = now   // baseline: starvation is measured from session start
         } else {
             listening = false
             releaseAt = now
@@ -89,7 +100,8 @@ final class WidgetSignals {
             listening: listening,
             lastSnapAt: lastSnapAt,
             releaseAt: releaseAt,
-            releaseConfidence: releaseConfidence
+            releaseConfidence: releaseConfidence,
+            lastResultAt: lastResultAt
         )
     }
 }
