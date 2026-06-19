@@ -198,3 +198,37 @@ how often the guard fires and lets a follow-up baseline quantify precision. If a
 text-bearing (gated) log is ever added, the no-space/prefix predicates can be
 measured directly; the len-only log cannot separate truncation from a
 prefix-shaped revision per-session.
+
+## 2026-06-18 - The Eyes: on-device screen perception (new capability, Phase 1)
+
+New peripheral subsystem ("the eyes"): the app can watch a user-placed region of
+the screen and produce a live situational read, fully on-device. First brick of a
+larger goal (a see/speak/embody companion); see
+.claude/plans/the-eyes-screen-perception.md and the paired rollback.
+
+Decision / shape (Phase 1):
+- Capture: ScreenCaptureKit (SCScreenshotManager), one-shot per 3s heartbeat of a
+  resizable, persistent "look here" overlay frame (EyeOverlay). Region capture, not
+  full-display. The SCStream rolling replay buffer is deferred to Phase 3.
+- OCR: Apple Vision (VNRecognizeTextRequest), on-device.
+- Reasoning: Apple FoundationModels text LLM over the OCR text (the on-device model
+  is text-only in macOS 26.5 - verified; a local VLM via ollama for true pixel
+  sight is Phase 3). Mirrors Cleanup.swift; fails open.
+- Delta gate: a cheap text-change ratio gates re-reasoning (Phase 1). The semantic
+  embedding gate + perceptual memory (reusing RAGIndex) is Phase 2.
+- Output: EyeSignals (in-memory bus) + a caption strip below the frame. The caption
+  sits OUTSIDE the watched rect so the eyes never OCR their own output.
+- Toggle: right-click / option-click the menu-bar mic. Off by default.
+
+ISOLATION: the eyes share nothing with the SEALED capture path (no change to
+SpeechAnalyzerSession or the Dictator capture path). New files only + launch
+wiring + a menu toggle.
+
+PHI POSTURE (load-bearing - the screen is the most sensitive surface on this box):
+- Frames and OCR text live in memory only; nothing is persisted in Phase 1.
+- Nothing leaves the device (no cloud model; ollama, when added, is localhost).
+- No frame / OCR text / summary is ever written to a cleartext log (only the
+  existing content-free NSLog lines on unavailability).
+- Requires the macOS Screen Recording TCC grant; capture fails closed (a status
+  hint) if denied. If any frame/text is ever persisted later, it must be AES-GCM
+  encrypted at rest and Spotlight-excluded, exactly like RecordingDatabase.

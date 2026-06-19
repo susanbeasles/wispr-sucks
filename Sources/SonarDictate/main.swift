@@ -1359,6 +1359,19 @@ if #available(macOS 26.0, *) {
     // before the first dictation. It morphs between idle (small icon) and
     // listening (expanded with live transcript) as sessions come and go.
     overlay.install()
+
+    // The eyes: an on-device screen-perception loop, isolated from the sealed
+    // capture path. A resizable "look here" frame the user places, a 3s OCR
+    // heartbeat, a delta gate, and an Apple on-device LLM situational read pushed
+    // to the caption + EyeSignals. Off by default; right-click the menu-bar mic
+    // (or option-click) to start/stop watching. See
+    // .claude/plans/the-eyes-screen-perception.md.
+    let eyeOverlay = EyeOverlay()
+    let eye = Eye()
+    eye.attach(overlay: eyeOverlay)
+    eyeOverlay.install()
+    statusItem.onToggleEyes = { eye.toggle() }
+
     dictator.bootstrap()
     // Warm the speech model in the background at launch (no mic) so the FIRST
     // dictation isn't the slow one - kills the "big delay when I first start".
