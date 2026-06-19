@@ -1,6 +1,4 @@
 import Foundation
-import NaturalLanguage
-import CryptoKit
 
 // Local RAG index over the user's encrypted recording corpus.
 //
@@ -54,47 +52,23 @@ enum RAGError: Error, CustomStringConvertible {
 final class RAGIndex {
     private static let indexFileName = "rag-index.enc"
     private static let indexSalt = "__sonar_dictate_rag_index__"
+    private static let indexInfo = "sonar-dictate.v1.rag"
 
-    private let embedding: NLContextualEmbedding
-    private let key: SecureEnclave.P256.KeyAgreement.PrivateKey
+    private let embedder: TextEmbedder
+    private let box: EnclaveBox
     private let indexURL: URL
     private let queue = DispatchQueue(label: "sonar-dictate.rag", qos: .utility)
 
     private var entries: [RAGEntry] = []
 
     init() throws {
-        // Embedding model. macOS 14+ ships NLContextualEmbedding. Assets are
-        // provisioned opportunistically by the OS - we don't force a download
-        // here; we just gate on `hasAvailableAssets` and gracefully no-op
-        // until the system has the model loaded.
-        guard let emb = NLContextualEmbedding(language: .english) else {
-            throw RAGError.embeddingUnavailable
-        }
-        try? emb.load()
-        self.embedding = emb
-
-        // Reuse the same encrypted store + Secure Enclave key.
-        let baseDir = SecureStore.baseDir
-        if !FileManager.default.fileExists(atPath: baseDir.path) {
-            try FileManager.default.createDirectory(
-                at: baseDir,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        }
-        let keyURL = baseDir.appendingPathComponent("device.enclave-key")
-        if FileManager.default.fileExists(atPath: keyURL.path) {
-            let rep = try Data(contentsOf: keyURL)
-            self.key = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: rep)
-        } else {
-            guard SecureEnclave.isAvailable else { throw SecureStoreError.secureEnclaveUnavailable }
-            let newKey = try SecureEnclave.P256.KeyAgreement.PrivateKey()
-            try newKey.dataRepresentation.write(to: keyURL, options: [.completeFileProtection, .atomic])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
-            self.key = newKey
-        }
-
-        self.indexURL = baseDir.appendingPathComponent(Self.indexFileName)
+        // On-device embedding + the device-local encryption envelope, both shared
+        // with the eyes' perception memory (TextEmbedder / EnclaveBox). Same SE key
+        // file, same salt + info as before, so existing rag-index.enc still decrypts.
+        self.embedder = try TextEmbedder()
+        let key = try EnclaveKey.loadOrCreate()
+        self.box = EnclaveBox(key: key, salt: Self.indexSalt, info: Self.indexInfo)
+        self.indexURL = SecureStore.baseDir.appendingPathComponent(Self.indexFileName)
         self.entries = (try? loadAll()) ?? []
     }
 
@@ -102,14 +76,14 @@ final class RAGIndex {
 
     var count: Int { entries.count }
 
-    var assetsReady: Bool { embedding.hasAvailableAssets }
+    var assetsReady: Bool { embedder.assetsReady }
 
     // Ingest a recording. Embeds the transcript, appends to the in-memory
     // index, and persists encrypted to disk. Designed to be called from
     // the background persistence path.
     func add(id: String, transcript: String, appContext: String?, createdAt: Date) throws {
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let vector = try meanPooledEmbedding(of: transcript)
+        let vector = try embedder.vector(for: transcript)
         let preview = String(transcript.prefix(160))
         let entry = RAGEntry(
             id: id,
@@ -129,7 +103,7 @@ final class RAGIndex {
     // app the user is currently dictating into.
     func query(_ text: String, k: Int = 8, appContext: String? = nil) throws -> [RAGHit] {
         guard !entries.isEmpty else { return [] }
-        let q = try meanPooledEmbedding(of: text)
+        let q = try embedder.vector(for: text)
         let pool: [RAGEntry]
         if let appContext = appContext {
             let scoped = entries.filter { $0.appContext == appContext }
@@ -138,7 +112,7 @@ final class RAGIndex {
         } else {
             pool = entries
         }
-        let scored = pool.map { RAGHit(entry: $0, score: Self.cosine(q, $0.vector)) }
+        let scored = pool.map { RAGHit(entry: $0, score: TextEmbedder.cosine(q, $0.vector)) }
         return scored.sorted { $0.score > $1.score }.prefix(k).map { $0 }
     }
 
@@ -170,43 +144,7 @@ final class RAGIndex {
         try? FileManager.default.removeItem(at: indexURL)
     }
 
-    // MARK: - Embedding
-
-    private func meanPooledEmbedding(of text: String) throws -> [Double] {
-        guard embedding.hasAvailableAssets else {
-            throw RAGError.embeddingAssetsNotReady
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw RAGError.embeddingFailed }
-
-        let result = try embedding.embeddingResult(for: trimmed, language: .english)
-        var sum: [Double] = []
-        var n = 0
-        result.enumerateTokenVectors(in: trimmed.startIndex..<trimmed.endIndex) { vec, _ in
-            if sum.isEmpty { sum = Array(repeating: 0, count: vec.count) }
-            for i in 0..<min(sum.count, vec.count) {
-                sum[i] += vec[i]
-            }
-            n += 1
-            return true
-        }
-        guard n > 0 else { throw RAGError.embeddingFailed }
-        for i in 0..<sum.count { sum[i] /= Double(n) }
-        return sum
-    }
-
-    private static func cosine(_ a: [Double], _ b: [Double]) -> Double {
-        let len = min(a.count, b.count)
-        guard len > 0 else { return 0 }
-        var dot = 0.0, na = 0.0, nb = 0.0
-        for i in 0..<len {
-            dot += a[i] * b[i]
-            na += a[i] * a[i]
-            nb += b[i] * b[i]
-        }
-        guard na > 0, nb > 0 else { return 0 }
-        return dot / (sqrt(na) * sqrt(nb))
-    }
+    // MARK: - Term extraction
 
     private static func extractTerms(from transcripts: [String]) -> [String] {
         var seen = Set<String>()
@@ -231,7 +169,7 @@ final class RAGIndex {
         guard FileManager.default.fileExists(atPath: indexURL.path) else { return [] }
         let blob = try Data(contentsOf: indexURL)
         guard !blob.isEmpty else { return [] }
-        let plain = try decrypt(blob: blob)
+        let plain = try box.open(blob)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([RAGEntry].self, from: plain)
@@ -242,50 +180,8 @@ final class RAGIndex {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let plain = try encoder.encode(snapshot)
-        let blob = try encrypt(plaintext: plain)
+        let blob = try box.seal(plain)
         try blob.write(to: indexURL, options: [.completeFileProtection, .atomic])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: indexURL.path)
-    }
-
-    private func encrypt(plaintext: Data) throws -> Data {
-        let ephemeral = P256.KeyAgreement.PrivateKey()
-        let shared = try key.sharedSecretFromKeyAgreement(with: ephemeral.publicKey)
-        let derived = shared.hkdfDerivedSymmetricKey(
-            using: SHA256.self,
-            salt: Data(Self.indexSalt.utf8),
-            sharedInfo: Data("sonar-dictate.v1.rag".utf8),
-            outputByteCount: 32
-        )
-        let sealed = try AES.GCM.seal(plaintext, using: derived)
-        guard let combined = sealed.combined else {
-            throw SecureStoreError.malformedCiphertext
-        }
-        let pubBytes = ephemeral.publicKey.rawRepresentation
-        var blob = Data()
-        var len = UInt32(pubBytes.count).bigEndian
-        blob.append(Data(bytes: &len, count: 4))
-        blob.append(pubBytes)
-        blob.append(combined)
-        return blob
-    }
-
-    private func decrypt(blob: Data) throws -> Data {
-        guard blob.count > 4 else { throw SecureStoreError.malformedCiphertext }
-        let lenBE: UInt32 = blob.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
-        let pubLen = Int(UInt32(bigEndian: lenBE))
-        let pubEnd = 4 + pubLen
-        guard blob.count > pubEnd else { throw SecureStoreError.malformedCiphertext }
-        let pubBytes = blob.subdata(in: 4..<pubEnd)
-        let sealedBytes = blob.subdata(in: pubEnd..<blob.count)
-        let ephPub = try P256.KeyAgreement.PublicKey(rawRepresentation: pubBytes)
-        let shared = try key.sharedSecretFromKeyAgreement(with: ephPub)
-        let derived = shared.hkdfDerivedSymmetricKey(
-            using: SHA256.self,
-            salt: Data(Self.indexSalt.utf8),
-            sharedInfo: Data("sonar-dictate.v1.rag".utf8),
-            outputByteCount: 32
-        )
-        let sealed = try AES.GCM.SealedBox(combined: sealedBytes)
-        return try AES.GCM.open(sealed, using: derived)
     }
 }

@@ -232,3 +232,27 @@ PHI POSTURE (load-bearing - the screen is the most sensitive surface on this box
 - Requires the macOS Screen Recording TCC grant; capture fails closed (a status
   hint) if denied. If any frame/text is ever persisted later, it must be AES-GCM
   encrypted at rest and Spotlight-excluded, exactly like RecordingDatabase.
+
+## 2026-06-19 - The Eyes Phase 2: semantic gate + encrypted perception memory
+
+The eyes now detect change by MEANING and remember what they noticed.
+
+- Shared crypto + embedding: the Secure Enclave envelope (encrypt/decrypt) and the
+  NLContextualEmbedding mean-pooling were duplicated risk waiting to happen, so
+  both were extracted from RAGIndex into EnclaveBox/EnclaveKey and TextEmbedder.
+  RAGIndex was refactored onto them (one implementation, two call sites). RAG's
+  on-disk format is unchanged - same salt ("__sonar_dictate_rag_index__") and info
+  ("sonar-dictate.v1.rag") - so existing rag-index.enc still decrypts. Do not
+  duplicate this crypto a third time; use EnclaveBox.
+- Semantic delta gate (Eye): each tick's OCR text is embedded; novelty = cosine
+  distance from the centroid of a rolling window of recent frame embeddings.
+  Escalate (re-reason) only above noveltyThreshold, after a cheap text-ratio
+  pre-filter. Pixel/clock churn no longer triggers reasoning; a real context
+  switch does. Falls back to the text-ratio gate if the embedder is unavailable.
+- PerceptionMemory: a SEPARATE encrypted store (perception.enc, distinct salt
+  "__sonar_dictate_perception__") of {time, embedding, summary} for each escalated
+  tick. NOT folded into the dictation RAG index - mixing would pollute the
+  vocabulary-bias query. Recall is by meaning (cosine over a query embedding);
+  exposed out-of-process via `sonar-dictate eyes recall <text>`. Bounded to a
+  rolling 2000-entry window. The summary is PHI-bearing and lives only inside this
+  encrypted file.

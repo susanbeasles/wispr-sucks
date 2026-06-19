@@ -9,8 +9,9 @@ import AppKit
 // one thread - no locks, no races. The capture/OCR/reason work runs in awaited
 // async/detached calls, so the main thread is never blocked.
 //
-// Phase 1 delta gate is a cheap text-change ratio. Phase 2 swaps changed() for
-// semantic embedding distance (reusing RAGIndex) without touching the loop.
+// The delta gate is semantic (Phase 2): a cheap text-ratio pre-filter, then
+// cosine novelty vs a rolling centroid of recent frame embeddings (TextEmbedder).
+// Noticed moments are written to PerceptionMemory for recall by meaning.
 // Note: not @MainActor-annotated so it can be constructed from main.swift's
 // non-isolated top-level code, but every method runs on the main thread in
 // practice - start/stop/toggle are called from the main-thread menu action, the
@@ -26,13 +27,34 @@ final class Eye {
     private var busy = false
     private var lastText = ""
 
+    // Phase 2: semantic perception. Optional - if the embedder/memory failed to
+    // init (e.g. embedding assets not ready), the loop falls back to the cheap
+    // text-ratio gate and simply does not record memory.
+    private var embedder: TextEmbedder?
+    private var memory: PerceptionMemory?
+    // A rolling window of recent per-tick embeddings; its centroid is "what I have
+    // been looking at," and a new frame far from it is the meaningful change.
+    private var recentVectors: [[Double]] = []
+    private let recentWindow = 8
+
     private let intervalSec = 3.0
-    // Tunable: how much the OCR text must change (0..1) before we re-reason.
-    // Suppresses micro-churn (a blinking cursor, a clock tick). Phase 2 replaces
-    // this magnitude with a semantic-distance threshold.
-    private let deltaThreshold = 0.15
+    // Cheap pre-filter: skip embedding/reasoning when the OCR text is essentially
+    // unchanged (a blinking cursor, a ticking clock). Low so the semantic gate,
+    // not this, decides real escalation.
+    private let textPrefilter = 0.04
+    // The real gate (Phase 2): cosine DISTANCE from the recent centroid. Above
+    // this, the meaning changed enough to re-reason. Tunable - up = calmer,
+    // down = more reactive.
+    private let noveltyThreshold = 0.12
 
     func attach(overlay: EyeOverlay) { self.overlay = overlay }
+
+    // Phase 2 wiring (optional). Without it the eyes still see; they just do not
+    // gate semantically or remember.
+    func attachMemory(embedder: TextEmbedder?, memory: PerceptionMemory?) {
+        self.embedder = embedder
+        self.memory = memory
+    }
 
     func toggle() { isWatching ? stop() : start() }
 
@@ -40,6 +62,7 @@ final class Eye {
         guard !isWatching else { return }
         isWatching = true
         lastText = ""
+        recentVectors.removeAll()
         EyeSignals.shared.setWatching(true)
         overlay?.showFrame()
 
@@ -73,25 +96,58 @@ final class Eye {
                 // OCR is synchronous CPU work - run it off the main thread.
                 let text = await Task.detached { ScreenText.recognize(image) }.value
                 guard self.isWatching else { return }
-                guard self.changed(text) else { return }
-                self.lastText = text
 
-                let summary = await self.reasoner.summarize(current: text, previous: previous)
+                let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !t.isEmpty else { return }
+                // Cheap pre-filter: ignore micro-churn before paying for an embedding.
+                if !self.lastText.isEmpty, Eye.normalizedDistance(self.lastText, t) < self.textPrefilter {
+                    return
+                }
+
+                // Semantic gate. Embed the text; novelty = cosine distance from the
+                // centroid of recent frames. If the embedder is unavailable, fall
+                // back to "any non-trivial text change escalates."
+                let vector = try? self.embedder?.vector(for: t)
+                let escalate: Bool
+                if let v = vector {
+                    let novelty = Eye.novelty(of: v, against: self.recentVectors)
+                    escalate = self.lastText.isEmpty || novelty >= self.noveltyThreshold
+                    self.recentVectors.append(v)
+                    if self.recentVectors.count > self.recentWindow {
+                        self.recentVectors.removeFirst(self.recentVectors.count - self.recentWindow)
+                    }
+                } else {
+                    escalate = true   // no embedder: pre-filter already proved a change
+                }
+                self.lastText = t
+                guard escalate else { return }
+
+                let summary = await self.reasoner.summarize(current: t, previous: previous)
                 guard self.isWatching, !summary.isEmpty else { return }
                 EyeSignals.shared.publishSummary(summary)
+
+                // Remember this noticed moment (encrypted, on-device) for recall.
+                if let v = vector {
+                    try? self.memory?.add(at: Date(), vector: v, summary: summary)
+                }
             } catch {
                 EyeSignals.shared.publishStatus("screen capture blocked - grant Screen Recording in System Settings")
             }
         }
     }
 
-    // Phase 1 delta gate: escalate only when the OCR text changed beyond the
-    // threshold. Empty reads never escalate; the first non-empty read always does.
-    private func changed(_ text: String) -> Bool {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return false }
-        if lastText.isEmpty { return true }
-        return Eye.normalizedDistance(lastText, t) >= deltaThreshold
+    // Novelty = 1 - cosine(current, centroid of recent). 1.0 (max) when there is
+    // no history yet, so the first frame always reads as new.
+    static func novelty(of vector: [Double], against recent: [[Double]]) -> Double {
+        guard !recent.isEmpty else { return 1.0 }
+        let dims = vector.count
+        guard dims > 0 else { return 1.0 }
+        var centroid = [Double](repeating: 0, count: dims)
+        for v in recent {
+            for i in 0..<min(dims, v.count) { centroid[i] += v[i] }
+        }
+        for i in 0..<dims { centroid[i] /= Double(recent.count) }
+        return 1.0 - TextEmbedder.cosine(vector, centroid)
     }
 
     // Cheap change magnitude in [0, 1]: 1 - (shared prefix + suffix) / max length.

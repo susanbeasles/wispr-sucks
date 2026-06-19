@@ -1187,6 +1187,42 @@ func runCLI(_ args: [String]) -> Never {
             try rag.reset()
             print("RAG index cleared. Recordings retained; future dictations will rebuild the index.")
 
+        // The eyes' perceptual memory - what the screen-watcher has noticed,
+        // retrievable by MEANING. The store is written by the running app; this
+        // reads the same encrypted file out-of-process.
+        case "eyes":
+            let sub = rest.first
+            let memory = try PerceptionMemory()
+            switch sub {
+            case nil, "stats":
+                print("perception memory entries: \(memory.count)")
+                print("embedding model assets ready: \(((try? TextEmbedder())?.assetsReady) ?? false)")
+            case "recall":
+                let query = rest.dropFirst().joined(separator: " ")
+                guard !query.isEmpty else {
+                    fputs("usage: sonar-dictate eyes recall <text...>\n", stderr)
+                    exit(2)
+                }
+                let vector = try TextEmbedder().vector(for: query)
+                let hits = memory.recall(vector: vector, k: 5)
+                if hits.isEmpty {
+                    print("(nothing remembered yet - watch the screen first: right-click the menu-bar mic)")
+                } else {
+                    let df = ISO8601DateFormatter()
+                    for h in hits {
+                        print(String(format: "%.3f  ", h.score) + df.string(from: h.entry.at))
+                        print("        \(h.entry.summary.replacingOccurrences(of: "\n", with: " "))")
+                    }
+                }
+            case "reset", "wipe":
+                try memory.reset()
+                print("perception memory cleared.")
+            default:
+                fputs("unknown eyes subcommand: \(sub ?? "")\n", stderr)
+                fputs("usage: sonar-dictate eyes [stats | recall <text...> | reset]\n", stderr)
+                exit(2)
+            }
+
         // Hidden dev path. Inserts a synthetic correction row through the full
         // encryption + write path. Proves the EditWatcher's database call
         // works end-to-end without requiring a real dictation + manual edit
@@ -1276,6 +1312,11 @@ func runCLI(_ args: [String]) -> Never {
               rag                           index stats + embedding model status
               similar <text...>             top-5 past recordings by cosine similarity
               rag-reset                     drop the index (recordings stay; reindex next session)
+
+            eyes (on-device screen perception - right-click the menu-bar mic to watch):
+              eyes                          perception memory stats
+              eyes recall <text...>         top-5 noticed moments by meaning
+              eyes reset                    wipe the perception memory
 
             dictionary (personalization - biases the recognizer to your words):
               dict                          list dictionary terms by weight
@@ -1369,6 +1410,10 @@ if #available(macOS 26.0, *) {
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)
+    // Phase 2: semantic delta gate + encrypted, queryable perception memory
+    // (reusing the on-device embedder + Secure Enclave envelope). Best-effort - if
+    // either fails to init, the eyes still see; they just do not remember.
+    eye.attachMemory(embedder: try? TextEmbedder(), memory: try? PerceptionMemory())
     eyeOverlay.install()
     statusItem.onToggleEyes = { eye.toggle() }
 
