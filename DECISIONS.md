@@ -256,3 +256,34 @@ The eyes now detect change by MEANING and remember what they noticed.
   exposed out-of-process via `sonar-dictate eyes recall <text>`. Bounded to a
   rolling 2000-entry window. The summary is PHI-bearing and lives only inside this
   encrypted file.
+
+## 2026-06-19 - Iris: silent perception, conversational, memory-as-brain
+
+The eyes peripheral became "Iris," a companion. Decisions:
+- Rename is DISPLAY-ONLY: the app shows "Iris" (Info.plist + UI strings), but the
+  bundle id (com.sonarmd.dictate), the storage path (.../SonarDictate/recordings),
+  and the CLI name (sonar-dictate) are UNCHANGED - to preserve the TCC grants
+  (Screen Recording, Accessibility, Mic) and the existing encrypted data. A full
+  identity migration (com.<x>.iris + a renamed data dir) is deferred to a single
+  deliberate step.
+- Her brain is a local ollama model (models/iris.Modelfile) on qwen2.5vl:7b: a fast
+  (~0.8s warm), NON-thinking vision-language model. Chosen over the qwen3 30B MoE,
+  which in this ollama build cannot disable its chain-of-thought (~6-13s/reply) -
+  fatal for a companion. The VLM base also gives a path to native pixel sight.
+  Apple's on-device FoundationModels stays the fallback when ollama is unreachable.
+- She is SILENT by default. The eyes observe, embed, and FILE a terse note into her
+  memory on each meaningful change - NO narration. The frame caption shows only a
+  content-free status ("watching - N remembered"). She speaks ONLY in the
+  conversation window (IrisChat), her replies STREAM, and only when spoken to.
+- ONE shared memory (PerceptionMemory) is her brain: observations AND conversation
+  (your utterances + her replies) are embedded, kind-tagged (observation/utterance/
+  reply), classified (best-effort tags), and stored encrypted. On a question she
+  answers from recall (cosine over the memory) + the current on-screen text.
+- Controls: ctrl-opt-E (watch + open chat), ctrl-opt-I (talk), and a click X on the
+  frame to close. The status-item right-click toggle was removed (unreliable).
+  KNOWN LIMIT: global key hotkeys are eaten by a terminal's Secure Keyboard Entry,
+  so they must be pressed with a NON-terminal app focused; the chat window, once
+  open, takes typed input directly regardless.
+
+PHI: entirely on-device. ollama is localhost-only; nothing leaves the box; the
+memory is AES-GCM encrypted at rest; no frame / OCR / summary in cleartext logs.

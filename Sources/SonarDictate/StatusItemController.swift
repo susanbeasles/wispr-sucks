@@ -23,10 +23,6 @@ final class StatusItemController: NSObject {
         didSet { panel.history = history }
     }
 
-    // Right-click (or option-click) the menu-bar mic toggles the screen eyes.
-    // Wired in main. A left-click still opens the control-panel popover.
-    var onToggleEyes: (() -> Void)?
-
     init(store: SecureStore, workflows: WorkflowStore, rag: RAGIndex, dictionary: DictionaryStore) {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.store = store
@@ -46,8 +42,6 @@ final class StatusItemController: NSObject {
         if let button = statusItem.button {
             button.action = #selector(togglePanel)
             button.target = self
-            // Receive right-clicks too, so we can route them to the eyes toggle.
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
     }
 
@@ -67,12 +61,6 @@ final class StatusItemController: NSObject {
     // MARK: - Popover
 
     @objc private func togglePanel() {
-        // Right-click or option-click -> toggle the screen eyes instead of the panel.
-        if let event = NSApp.currentEvent,
-           event.type == .rightMouseUp || event.modifierFlags.contains(.option) {
-            onToggleEyes?()
-            return
-        }
         if popover.isShown { closePanel() } else { showPanel() }
     }
 
@@ -100,10 +88,10 @@ final class StatusItemController: NSObject {
     private func setIcon(listening: Bool) {
         guard let button = statusItem.button else { return }
         let name = listening ? "mic.circle.fill" : "mic.circle"
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "SonarDictate")
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: "Iris")
         image?.isTemplate = true
         button.image = image
-        button.toolTip = listening ? "SonarDictate - listening" : "SonarDictate - idle"
+        button.toolTip = listening ? "Iris - listening" : "Iris - idle"
     }
 
     // MARK: - Reset (destructive; owned here, invoked from the panel)
@@ -111,7 +99,7 @@ final class StatusItemController: NSObject {
     private func handleReset() {
         closePanel()
         let alert = NSAlert()
-        alert.messageText = "Reset SonarDictate storage?"
+        alert.messageText = "Reset Iris storage?"
         alert.informativeText = """
         Deletes every recording, transcript, RAG index entry, workflow \
         binding, and the Secure Enclave key. Anything in backups or \
@@ -141,7 +129,7 @@ final class StatusItemController: NSObject {
 
         let done = NSAlert()
         done.messageText = "Storage reset complete."
-        done.informativeText = "SonarDictate needs to restart so it can re-create the encryption key. Quitting now."
+        done.informativeText = "Iris needs to restart so it can re-create the encryption key. Quitting now."
         done.alertStyle = .informational
         done.addButton(withTitle: "Quit")
         done.runModal()

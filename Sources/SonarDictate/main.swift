@@ -1407,15 +1407,39 @@ if #available(macOS 26.0, *) {
     // to the caption + EyeSignals. Off by default; right-click the menu-bar mic
     // (or option-click) to start/stop watching. See
     // .claude/plans/the-eyes-screen-perception.md.
+    // One on-device embedder + one encrypted memory, SHARED by the silent eyes
+    // (which fill it) and the conversation (which fills + reads it). That shared
+    // memory is Iris's brain.
+    let irisEmbedder = try? TextEmbedder()
+    let irisMemory = try? PerceptionMemory()
+
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)
-    // Phase 2: semantic delta gate + encrypted, queryable perception memory
-    // (reusing the on-device embedder + Secure Enclave envelope). Best-effort - if
-    // either fails to init, the eyes still see; they just do not remember.
-    eye.attachMemory(embedder: try? TextEmbedder(), memory: try? PerceptionMemory())
+    eye.attachMemory(embedder: irisEmbedder, memory: irisMemory)
     eyeOverlay.install()
-    statusItem.onToggleEyes = { eye.toggle() }
+
+    // Iris's conversation surface - the ONLY place she speaks, and only when
+    // spoken to. Shares the memory the eyes fill.
+    let irisChat = IrisChat()
+    irisChat.attach(memory: irisMemory, embedder: irisEmbedder)
+    irisChat.install()
+
+    // Global hotkeys (mirror the app's other ctrl-opt hotkeys; they work because
+    // the app holds Accessibility trust). Note: a terminal with Secure Keyboard
+    // Entry focused will eat these - press them with another app focused.
+    NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { event in
+        let ctrlOpt = event.modifierFlags.contains(.control) && event.modifierFlags.contains(.option)
+        if ctrlOpt, event.keyCode == 14 {        // ctrl-opt-E -> start/stop watching (+ open chat)
+            eye.toggle()
+            if eye.isWatching { irisChat.show() }
+        } else if ctrlOpt, event.keyCode == 34 { // ctrl-opt-I -> talk to Iris
+            irisChat.show()
+        }
+    }
+    NSLog("SonarDictate: iris hotkeys installed (ctrl-opt-E watch, ctrl-opt-I talk)")
+    // Warm Iris into RAM so her first reply is not the slow cold-load one.
+    IrisClient.prewarm()
 
     dictator.bootstrap()
     // Warm the speech model in the background at launch (no mic) so the FIRST

@@ -52,7 +52,7 @@ final class ControlPanelController: NSViewController {
         root.translatesAutoresizingMaskIntoConstraints = false
 
         // Header: title + live state.
-        let title = NSTextField(labelWithString: "SonarDictate")
+        let title = NSTextField(labelWithString: "Iris")
         title.font = .boldSystemFont(ofSize: 13)
         stateLabel.font = .systemFont(ofSize: 11)
         stateLabel.textColor = .secondaryLabelColor
@@ -120,7 +120,7 @@ final class ControlPanelController: NSViewController {
         root.addArrangedSubview(actionButton("Dictation History...", #selector(handleHistory)))
         root.addArrangedSubview(actionButton("Show Storage in Finder", #selector(handleOpenDir)))
         root.addArrangedSubview(actionButton("Reset Storage...", #selector(handleReset)))
-        root.addArrangedSubview(actionButton("Quit SonarDictate", #selector(handleQuit)))
+        root.addArrangedSubview(actionButton("Quit Iris", #selector(handleQuit)))
 
         root.widthAnchor.constraint(equalToConstant: panelWidth).isActive = true
         self.view = root

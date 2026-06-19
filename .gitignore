@@ -5,3 +5,6 @@
 DerivedData/
 .DS_Store
 dist/
+
+# Playwright MCP scratch artifacts (not project code)
+.playwright-mcp/

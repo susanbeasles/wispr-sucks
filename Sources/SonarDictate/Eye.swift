@@ -47,7 +47,12 @@ final class Eye {
     // down = more reactive.
     private let noveltyThreshold = 0.12
 
-    func attach(overlay: EyeOverlay) { self.overlay = overlay }
+    func attach(overlay: EyeOverlay) {
+        self.overlay = overlay
+        // The frame's X button stops watching - a reliable, keyboard-free close
+        // (the Ctrl-Opt-E hotkey is eaten by secure input in terminals).
+        overlay.onClose = { [weak self] in self?.stop() }
+    }
 
     // Phase 2 wiring (optional). Without it the eyes still see; they just do not
     // gate semantically or remember.
@@ -63,6 +68,7 @@ final class Eye {
         isWatching = true
         lastText = ""
         recentVectors.removeAll()
+        NSLog("SonarDictate: eyes START (overlay attached: \(overlay != nil))")
         EyeSignals.shared.setWatching(true)
         overlay?.showFrame()
 
@@ -87,7 +93,6 @@ final class Eye {
         guard isWatching, !busy else { return }
         guard let region = overlay?.captureRegion(), region.width > 4, region.height > 4 else { return }
         busy = true
-        let previous = lastText
 
         Task { @MainActor in
             defer { self.busy = false }
@@ -120,16 +125,17 @@ final class Eye {
                     escalate = true   // no embedder: pre-filter already proved a change
                 }
                 self.lastText = t
-                guard escalate else { return }
+                EyeSignals.shared.setLatestObservation(t)
+                guard escalate, let v = vector else { return }
 
-                let summary = await self.reasoner.summarize(current: t, previous: previous)
-                guard self.isWatching, !summary.isEmpty else { return }
-                EyeSignals.shared.publishSummary(summary)
-
-                // Remember this noticed moment (encrypted, on-device) for recall.
-                if let v = vector {
-                    try? self.memory?.add(at: Date(), vector: v, summary: summary)
-                }
+                // SILENT: she condenses what she sees for her OWN memory and files
+                // it - no narration, she does not speak. If reasoning is
+                // unavailable, she remembers the raw text instead.
+                let note = await self.reasoner.summarize(current: t, previous: nil)
+                guard self.isWatching else { return }
+                let content = note.isEmpty ? String(t.prefix(600)) : note
+                try? self.memory?.add(at: Date(), vector: v, summary: content, kind: "observation")
+                EyeSignals.shared.noteRemembered(self.memory?.count ?? 0)
             } catch {
                 EyeSignals.shared.publishStatus("screen capture blocked - grant Screen Recording in System Settings")
             }

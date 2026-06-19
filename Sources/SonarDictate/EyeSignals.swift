@@ -14,8 +14,9 @@ final class EyeSignals {
 
     struct Snapshot {
         var watching: Bool
-        var summary: String          // latest situational read (may be PHI; never persisted here)
-        var status: String           // short line: "idle", "watching", a permission hint, an error
+        var summary: String          // unused in silent mode (kept for the caption render)
+        var status: String           // short NON-narrative line: "watching - N remembered", a permission hint
+        var latestObservation: String  // current on-screen text (for conversation context; never narrated)
         var lastUpdateAt: CFTimeInterval
     }
 
@@ -23,9 +24,23 @@ final class EyeSignals {
     private var watching = false
     private var summary = ""
     private var status = "idle"
+    private var latestObservation = ""
     private var lastUpdateAt: CFTimeInterval = 0
 
     private init() {}
+
+    // The current on-screen text - kept so the chat can answer "what do you see"
+    // WITHOUT it ever being narrated in the caption. Not displayed.
+    func setLatestObservation(_ text: String) {
+        lock.lock(); latestObservation = text; lock.unlock()
+    }
+
+    // She just filed a memory. Update the quiet status (a count, not content).
+    func noteRemembered(_ count: Int) {
+        let now = CACurrentMediaTime()
+        lock.lock(); status = "watching - \(count) remembered"; lastUpdateAt = now; lock.unlock()
+        emit()
+    }
 
     // Set by a consumer (the caption overlay) to receive updates on the main thread.
     var onUpdate: ((Snapshot) -> Void)?
@@ -57,7 +72,8 @@ final class EyeSignals {
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(watching: watching, summary: summary, status: status, lastUpdateAt: lastUpdateAt)
+        return Snapshot(watching: watching, summary: summary, status: status,
+                        latestObservation: latestObservation, lastUpdateAt: lastUpdateAt)
     }
 
     private func emit() {

@@ -99,7 +99,7 @@ final class HistoryWindow: NSObject {
             backing: .buffered,
             defer: false
         )
-        win.title = "Dictation History"
+        win.title = "Iris - History"
         win.isReleasedWhenClosed = false
         win.minSize = NSSize(width: 480, height: 280)
         win.delegate = self

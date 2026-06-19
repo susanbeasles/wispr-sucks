@@ -11,9 +11,9 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>SonarDictate</string>
+    <string>Iris</string>
     <key>CFBundleDisplayName</key>
-    <string>Sonar Dictate</string>
+    <string>Iris</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -27,8 +27,8 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>SonarDictate needs microphone access to transcribe your speech on-device. Audio never leaves your Mac.</string>
+    <string>Iris needs microphone access to transcribe your speech on-device. Audio never leaves your Mac.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>SonarDictate uses Apple's on-device speech recognition. No data is sent to Apple servers.</string>
+    <string>Iris uses Apple's on-device speech recognition. No data is sent to Apple servers.</string>
 </dict>
 </plist>

@@ -30,6 +30,9 @@ final class EyeOverlay {
     private var captionWindow: NSWindow?
     private var captionLabel: NSTextField?
 
+    // Called when the user clicks the frame's X (stop watching). Wired by Eye.
+    var onClose: (() -> Void)?
+
     // Build both windows (hidden) and subscribe to the signal bus. Call once at
     // launch; showFrame()/hideFrame() flip visibility when watching starts/stops.
     func install() {
@@ -45,6 +48,7 @@ final class EyeOverlay {
             self.repositionCaption()
             self.frameWindow?.orderFront(nil)
             self.captionWindow?.orderFront(nil)
+            NSLog("SonarDictate: eyes showFrame - frame at \(self.frameWindow?.frame ?? .zero), visible: \(self.frameWindow?.isVisible ?? false)")
         }
     }
 
@@ -82,10 +86,9 @@ final class EyeOverlay {
 
         let view = EyeFrameView(frame: NSRect(origin: .zero, size: frame.size))
         view.autoresizingMask = [.width, .height]
-        view.gripSize = 18
-        view.borderBand = 10
         view.onLiveChange = { [weak self] in self?.repositionCaption() }
         view.onCommit = { [weak self] in self?.saveFrame() }
+        view.onClose = { [weak self] in self?.onClose?() }
         fw.contentView = view
         frameView = view
         frameWindow = fw
@@ -191,69 +194,68 @@ final class EyeFrameWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 }
 
-// Draws the "look here" border + grip, and handles move/resize from the border
-// band and the bottom-right grip. The interior is click-through.
+// The "look here" frame. Bulletproof interaction (no keyboard needed):
+//   - drag ANYWHERE on the frame to move it,
+//   - drag the bottom-right grip to resize,
+//   - click the top-right X to close (stop watching).
+// The whole frame captures clicks (it sits ON the region being watched, not
+// something you work under), so it can always be grabbed - the old version made
+// the interior click-through and the edges too thin to hit, which trapped it.
 final class EyeFrameView: NSView {
-    var gripSize: CGFloat = 18
-    var borderBand: CGFloat = 10
+    var gripSize: CGFloat = 26
+    var closeSize: CGFloat = 28
     var onLiveChange: (() -> Void)?   // fired during a drag (reposition caption)
     var onCommit: (() -> Void)?       // fired on mouse-up (persist)
+    var onClose: (() -> Void)?        // fired when the X is clicked
 
     private enum Mode { case move, resize }
     private var mode: Mode = .move
     private var startMouse: NSPoint = .zero
     private var startFrame: NSRect = .zero
 
-    override var isFlipped: Bool { false }   // bottom-left origin, matches AppKit window coords
+    override var isFlipped: Bool { false }   // bottom-left origin, matches window coords
 
-    // Only the border band and the grip are interactive; the interior passes
-    // clicks through to whatever is underneath so the user keeps working.
+    // Capture clicks across the whole frame so it can always be moved/resized/closed.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let parent = superview else { return nil }
-        let p = convert(point, from: parent)
-        guard bounds.contains(p) else { return nil }
-        if gripRect.contains(p) || nearBorder(p) { return self }
-        return nil
+        guard let parent = superview else { return self }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
     }
 
     private var gripRect: NSRect {
         NSRect(x: bounds.maxX - gripSize, y: bounds.minY, width: gripSize, height: gripSize)
     }
-
-    private func nearBorder(_ p: NSPoint) -> Bool {
-        p.x <= borderBand || p.x >= bounds.maxX - borderBand
-            || p.y <= borderBand || p.y >= bounds.maxY - borderBand
+    private var closeRect: NSRect {
+        NSRect(x: bounds.maxX - closeSize, y: bounds.maxY - closeSize, width: closeSize, height: closeSize)
     }
 
     override func mouseDown(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        if closeRect.contains(local) {
+            onClose?()
+            return
+        }
         startMouse = NSEvent.mouseLocation
         startFrame = window?.frame ?? .zero
-        let local = convert(event.locationInWindow, from: nil)
         mode = gripRect.contains(local) ? .resize : .move
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let window else { return }
+        guard let window, startFrame.width > 0 else { return }
         let now = NSEvent.mouseLocation
         let dx = now.x - startMouse.x
         let dy = now.y - startMouse.y
 
         switch mode {
         case .move:
-            var f = startFrame
-            f.origin.x = startFrame.minX + dx
-            f.origin.y = startFrame.minY + dy
-            window.setFrame(f, display: true)
+            window.setFrameOrigin(NSPoint(x: startFrame.minX + dx, y: startFrame.minY + dy))
         case .resize:
-            // Bottom-right grip: top edge fixed, right edge follows x, bottom edge
-            // follows y. Enforce the minimum size.
-            var f = startFrame
+            // Bottom-right grip: top edge fixed, width follows x, bottom follows y.
             let newW = max(EyeOverlayLimits.minWidth, startFrame.width + dx)
             let newMinY = min(startFrame.maxY - EyeOverlayLimits.minHeight, startFrame.minY + dy)
-            f.size.width = newW
-            f.origin.y = newMinY
-            f.size.height = startFrame.maxY - newMinY
-            window.setFrame(f, display: true)
+            window.setFrame(
+                NSRect(x: startFrame.minX, y: newMinY, width: newW, height: startFrame.maxY - newMinY),
+                display: true
+            )
         }
         onLiveChange?()
     }
@@ -264,34 +266,44 @@ final class EyeFrameView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let inset: CGFloat = 1.5
-        let r = bounds.insetBy(dx: inset, dy: inset)
+        let cyan = CGColor(srgbRed: 0.10, green: 0.85, blue: 0.95, alpha: 1.0)
+        let r = bounds.insetBy(dx: 1.5, dy: 1.5)
         let path = CGPath(roundedRect: r, cornerWidth: 10, cornerHeight: 10, transform: nil)
 
-        // Faint interior tint so the frame is visible but you see through it.
+        // Faint interior tint so it reads as a frame.
         ctx.addPath(path)
         ctx.setFillColor(CGColor(srgbRed: 0.10, green: 0.85, blue: 0.95, alpha: 0.06))
         ctx.fillPath()
 
-        // The "look here" border.
+        // Border.
         ctx.addPath(path)
-        ctx.setStrokeColor(CGColor(srgbRed: 0.10, green: 0.85, blue: 0.95, alpha: 0.9))
+        ctx.setStrokeColor(cyan.copy(alpha: 0.9)!)
         ctx.setLineWidth(2.0)
         ctx.strokePath()
 
-        // Bottom-right resize grip: two short corner ticks.
-        let g = gripRect
-        ctx.setStrokeColor(CGColor(srgbRed: 0.10, green: 0.85, blue: 0.95, alpha: 0.95))
+        // Top-right CLOSE button: a filled disc with an X.
+        let c = closeRect.insetBy(dx: 5, dy: 5)
+        ctx.setFillColor(CGColor(srgbRed: 0.10, green: 0.12, blue: 0.13, alpha: 0.92))
+        ctx.fillEllipse(in: c)
+        ctx.setStrokeColor(cyan)
+        ctx.setLineWidth(1.0)
+        ctx.strokeEllipse(in: c)
         ctx.setLineWidth(2.0)
         ctx.setLineCap(.round)
-        ctx.move(to: CGPoint(x: g.maxX - 3, y: g.minY + 5))
-        ctx.addLine(to: CGPoint(x: g.maxX - 3, y: g.minY + 3))
-        ctx.addLine(to: CGPoint(x: g.maxX - 5, y: g.minY + 3))
+        let pad: CGFloat = 5
+        ctx.move(to: CGPoint(x: c.minX + pad, y: c.minY + pad))
+        ctx.addLine(to: CGPoint(x: c.maxX - pad, y: c.maxY - pad))
+        ctx.move(to: CGPoint(x: c.minX + pad, y: c.maxY - pad))
+        ctx.addLine(to: CGPoint(x: c.maxX - pad, y: c.minY + pad))
         ctx.strokePath()
-        ctx.move(to: CGPoint(x: g.maxX - 3, y: g.minY + 11))
-        ctx.addLine(to: CGPoint(x: g.maxX - 3, y: g.minY + 3))
-        ctx.addLine(to: CGPoint(x: g.maxX - 11, y: g.minY + 3))
-        ctx.strokePath()
+
+        // Bottom-right resize grip: two corner ticks.
+        let g = gripRect
+        ctx.setStrokeColor(cyan)
+        ctx.setLineWidth(2.0)
+        ctx.setLineCap(.round)
+        ctx.move(to: CGPoint(x: g.maxX - 4, y: g.minY + 7));  ctx.addLine(to: CGPoint(x: g.maxX - 4, y: g.minY + 4)); ctx.addLine(to: CGPoint(x: g.maxX - 7, y: g.minY + 4)); ctx.strokePath()
+        ctx.move(to: CGPoint(x: g.maxX - 4, y: g.minY + 13)); ctx.addLine(to: CGPoint(x: g.maxX - 4, y: g.minY + 4)); ctx.addLine(to: CGPoint(x: g.maxX - 13, y: g.minY + 4)); ctx.strokePath()
     }
 }
 

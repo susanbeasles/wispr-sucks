@@ -15,8 +15,10 @@ import Foundation
 
 struct PerceptionEntry: Codable {
     let at: Date
-    let vector: [Double]   // mean-pooled embedding of the OCR text at this moment
-    let summary: String    // the situational read (PHI-bearing; encrypted at rest)
+    let vector: [Double]   // mean-pooled embedding of the content
+    let summary: String    // the remembered content (PHI-bearing; encrypted at rest)
+    var kind: String?      // "observation" (what she saw) | "utterance" (what you said) | "reply" (what she said)
+    var tags: [String]?    // lightweight classification of the content
 }
 
 struct PerceptionHit {
@@ -44,10 +46,10 @@ final class PerceptionMemory {
 
     var count: Int { queue.sync { entries.count } }
 
-    // Append a noticed moment and persist. Cheap; called from the eye loop on
-    // escalation only.
-    func add(at: Date, vector: [Double], summary: String) throws {
-        let entry = PerceptionEntry(at: at, vector: vector, summary: summary)
+    // Append a memory and persist. Used by the silent eye loop (observations) and
+    // the conversation (utterances + replies).
+    func add(at: Date, vector: [Double], summary: String, kind: String, tags: [String] = []) throws {
+        let entry = PerceptionEntry(at: at, vector: vector, summary: summary, kind: kind, tags: tags)
         queue.sync {
             entries.append(entry)
             if entries.count > Self.maxEntries {
