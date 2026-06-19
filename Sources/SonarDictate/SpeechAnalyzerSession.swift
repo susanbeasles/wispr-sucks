@@ -108,11 +108,16 @@ final class SpeechAnalyzerSession {
             let data = SFCustomLanguageModelData(locale: locale,
                                                  identifier: "com.sonarmd.sonardictate.vocab",
                                                  version: "1")
-            // High count = strong bias. count:10 was too weak to beat common
-            // homophones ("git" kept losing to "get"). Crank it so the user's jargon
-            // wins. (If this over-biases - normal "get" becoming "git" - dial down.)
+            // phraseBias = how hard the recognizer is pushed toward each jargon term.
+            // THE tuning knob. count:10 read as too weak and count:200 over-biased
+            // (normal "get" -> "git", everyday words pulled into jargon) - both were
+            // measured while the transcriber preset was misconfigured, which distorted
+            // how much bias was actually needed. With the preset restored, a MODERATE
+            // value favors the user's terms without steamrolling common words. Raise
+            // it if jargon is still mangled; lower it if normal words turn into jargon.
+            let phraseBias = 20
             for term in terms {
-                SFCustomLanguageModelData.PhraseCount(phrase: term, count: 200).insert(data: data)
+                SFCustomLanguageModelData.PhraseCount(phrase: term, count: phraseBias).insert(data: data)
             }
             try await data.export(to: assetURL)
             let config = SFSpeechLanguageModel.Configuration(languageModel: modelURL)
@@ -153,13 +158,19 @@ final class SpeechAnalyzerSession {
         // recorded audio (meetings, podcasts). DictationTranscriber is tuned
         // for the exact use case we have - live voice into text input.
         //
-        // Built from explicit options instead of the .progressiveLongDictation
-        // preset for ONE reason: the preset initializer cannot opt into
-        // attributeOptions, and we need .transcriptionConfidence to drive the
-        // widget's REAL confidence (the preset only gives volatile streaming).
-        // reportingOptions:[.volatileResults] reproduces the preset's live
-        // streaming-with-volatile-partials cadence (the live preview UX); the
-        // confidence attribute then rides on each result's text runs.
+        // Start from the .progressiveLongDictation PRESET and only ADD the
+        // confidence attribute. The preset bundles the recognition tuning for live
+        // long-form dictation in its transcriptionOptions + reportingOptions. An
+        // earlier version hand-rolled these as transcriptionOptions:[] +
+        // reportingOptions:[.volatileResults], assuming that reproduced the preset -
+        // it did NOT: dropping the preset's options degraded word accuracy and
+        // changed finalize timing (the last word got truncated). The ONLY thing the
+        // preset omits that we need is .transcriptionConfidence (drives the widget's
+        // real confidence). Preset is a struct that exposes its option sets, so copy
+        // them verbatim and union the confidence attribute in - recognition behavior
+        // is now identical to the preset; the confidence just rides along on result
+        // runs. (prewarm() uses the same preset, so warmup and live session match.)
+        let preset = DictationTranscriber.Preset.progressiveLongDictation
         var hints: Set<DictationTranscriber.ContentHint> = []
         if let cfg = customModelConfig {
             hints.insert(.customizedLanguage(modelConfiguration: cfg))   // bias toward the user's jargon
@@ -167,9 +178,9 @@ final class SpeechAnalyzerSession {
         let transcriber = DictationTranscriber(
             locale: locale,
             contentHints: hints,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
-            attributeOptions: [.transcriptionConfidence]
+            transcriptionOptions: preset.transcriptionOptions,
+            reportingOptions: preset.reportingOptions,
+            attributeOptions: preset.attributeOptions.union([.transcriptionConfidence])
         )
         self.transcriber = transcriber
 

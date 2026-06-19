@@ -74,9 +74,11 @@ final class RecordingOverlay {
             self.shrinkWork?.cancel()
             let work = DispatchWorkItem { [weak self] in self?.applyIdle() }
             self.shrinkWork = work
-            // ~0.2s = right as the white lock finishes filling (sweep completes
-            // ~0.18s into the release). Shrink starts the instant the white lands.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+            // ~0.55s: hold full size while the lock ring sweeps ALL the way around
+            // (the sweep completes ~0.43s into the 0.85s release arc) and begins to
+            // lock in, THEN shrink to the speck - so the full animation is actually
+            // seen instead of being cut off mid-sweep.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
         }
     }
 

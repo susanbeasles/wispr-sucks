@@ -41,6 +41,7 @@ final class LEDMicView: NSView {
     private var tNow = 0.0
     private var snapStart = -9.0, recStart = -9.0, relStart = -9.0
     private var lockStr = 0.0, recBonus = 0.0
+    private let relDur = 0.85   // release/lock arc seconds (key-up -> powered down). Longer so the lock sweep is actually seen travel around.
     private var releasing = false, idle = true
     private var lastSnapSeen = 0.0
 
@@ -184,7 +185,7 @@ final class LEDMicView: NSView {
         c += (Ctar - c) * 0.08
         nz += (Ntar - nz) * 0.1
 
-        let reP = (t - relStart) / 0.6
+        let reP = (t - relStart) / relDur
         let inRel = releasing && reP >= 0 && reP < 1
         if releasing, reP >= 1 { releasing = false; idle = true }
 
@@ -236,7 +237,7 @@ final class LEDMicView: NSView {
         // derived timing (mirror the mockup's tick)
         let rP = (t - recStart) / 0.6
         let rec = (rP >= 0 && rP < 1) ? sin(rP * .pi) : 0
-        let reP = (t - relStart) / 0.6
+        let reP = (t - relStart) / relDur
         let inRel = releasing && reP >= 0 && reP < 1
         let pwr = releasing ? (reP < 0.4 ? 1.0 : cl(1 - (reP-0.4)/0.5, 0, 1)) : (idle ? 0.0 : 1.0)
         let snP = (t - snapStart) / 0.13
@@ -256,6 +257,12 @@ final class LEDMicView: NSView {
         // bloom (under pixels; only visible during a confident release)
         let ringRect = R(0.95, 0.95, 22.1, 22.1)
         let ringPath = CGPath(roundedRect: ringRect, cornerWidth: 4.65*S, cornerHeight: 4.65*S, transform: nil)
+        // Edge ring that hugs the CONTAINER rim (vs the inset ringPath). Used by the
+        // recording pulse and the release lock so the EDGE itself lights up with no
+        // black gap outside it. Inset ~half the rim stroke so the stroke's outer edge
+        // lands on the container edge (masksToBounds clips anything beyond it).
+        let edgeRect = R(0.75, 0.75, 22.5, 22.5)
+        let edgePath = CGPath(roundedRect: edgeRect, cornerWidth: 5.4*S, cornerHeight: 5.4*S, transform: nil)
         if inRel {
             var bloomAmt = cl((lockStr - 0.5)/0.5, 0, 1); if recBonus > 0 { bloomAmt = cl(bloomAmt + 0.25, 0, 1) }
             let b2 = cl((reP - 0.16)/0.18, 0, 1)
@@ -336,44 +343,57 @@ final class LEDMicView: NSView {
         ctx.setLineCap(.round); ctx.setLineJoin(.round); ctx.strokePath()
         ctx.restoreGState()
 
-        // recording border: a RED rim that pulses on/off while listening, so you can
-        // see it's still capturing. It's replaced by the white lock ring on release.
+        // recording border: a RED rim ON the container edge that pulses while
+        // listening, so you can see it's still capturing. Drawn on edgePath (hugs the
+        // rim, no inset gap) - the EDGE itself is what pulses - wide, with a soft red
+        // glow. Replaced by the white lock ring on release.
         if !releasing && !idle {
-            let pulse = 0.25 + 0.6 * (0.5 + 0.5 * sin(t * 3.6))   // ~0.25..0.85, on/off
-            ctx.addPath(ringPath)
+            let pulse = 0.5 + 0.4 * (0.5 + 0.5 * sin(t * 3.6))   // ~0.5..0.9
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 3.5*S, color: mkColor(REC, pulse))
+            ctx.addPath(edgePath)
             ctx.setStrokeColor(mkColor(REC, pulse))
-            ctx.setLineWidth(0.6 * S); ctx.setLineCap(.round)
+            ctx.setLineWidth(1.6*S); ctx.setLineCap(.round); ctx.setLineJoin(.round)
             ctx.strokePath()
+            ctx.restoreGState()
         }
 
-        // release lock ring (white when confident, muted/partial/stuttering when not)
+        // release lock ring: sweeps ALL THE WAY around the container edge, then locks
+        // and fades. White when confident, muted/partial/stuttering when not. Quick
+        // but VISIBLE (the sweep travels over ~half the release arc instead of
+        // snapping shut), wide, with a soft glow. Drawn on edgePath so it traces the
+        // same rim the red pulse did - the edge locking in, not an inset ring.
         if inRel {
             let C = lockStr
             let whiteAmt = cl((C - 0.32)/0.5, 0, 1)
             let lockColor = Lc(MUTE, WHITE, whiteAmt)
-            let maxFill = 0.42 + C*0.58
-            // White ring fills over the first 0.3 of the (now 0.6s) release arc, so
-            // it completes in ~0.18s - quick - then the overlay shrinks immediately.
-            let sweep = 0.3
+            // Travel (near) the full loop; fully closed when confident.
+            let maxFill = cl(0.78 + C*0.30, 0, 1)
+            // Fill over the first ~half of the release arc (relDur*sweep ~= 0.43s) so
+            // you actually watch it travel around, then it holds, then fades.
+            let sweep = 0.5
             let fp = cl(reP/sweep, 0, 1); let ez2 = 1 - pow(1-fp, 2)
             let filled = (reP < sweep ? maxFill*ez2 : maxFill)
-            let fade = reP < 0.55 ? 1.0 : cl(1 - (reP-0.55)/0.45, 0, 1)
+            let fade = reP < 0.6 ? 1.0 : cl(1 - (reP-0.6)/0.4, 0, 1)
             let stutter = 1 - (1-C)*(0.32*(0.5 + 0.5*sin(t*26)) + ((sin(t*47 + reP*9) > 0.5) ? 0.4 : 0))
-            let op = (0.42 + 0.5*C) * 0.9 * fade * max(0.22, stutter)
+            let op = (0.42 + 0.5*C) * 0.95 * fade * max(0.22, stutter)
 
-            // total perimeter of the rounded-rect ring, in view units, for the partial sweep
-            let w = 22.1*S, r = 4.65*S
-            let perim = 2*(w + w - 4*r) + 2 * .pi * r
+            // perimeter of edgePath (rounded square) in view units, for the sweep dash
+            let side = 22.5*S, r = 5.4*S
+            let perim = 4*side - 8*r + 2 * .pi * r
             let dashLen = CGFloat(filled) * perim
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 3.0*S, color: mkColor(lockColor, op*whiteAmt))
             if whiteAmt > 0 {
-                ctx.addPath(ringPath); ctx.setStrokeColor(mkColor(lockColor, op*0.45*whiteAmt))
-                ctx.setLineWidth(0.5*S); ctx.setLineCap(.round)
+                ctx.addPath(edgePath); ctx.setStrokeColor(mkColor(lockColor, op*0.45*whiteAmt))
+                ctx.setLineWidth(1.4*S); ctx.setLineCap(.round)
                 ctx.setLineDash(phase: 0, lengths: [dashLen, perim]); ctx.strokePath()
             }
-            ctx.addPath(ringPath); ctx.setStrokeColor(mkColor(lockColor, op))
-            ctx.setLineWidth(0.33*S); ctx.setLineCap(.round)
+            ctx.addPath(edgePath); ctx.setStrokeColor(mkColor(lockColor, op))
+            ctx.setLineWidth(0.8*S); ctx.setLineCap(.round)
             ctx.setLineDash(phase: 0, lengths: [dashLen, perim]); ctx.strokePath()
             ctx.setLineDash(phase: 0, lengths: [])
+            ctx.restoreGState()
         }
     }
 }
