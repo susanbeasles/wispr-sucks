@@ -115,7 +115,7 @@ final class Eye {
                 let vector = try? self.embedder?.vector(for: t)
                 let escalate: Bool
                 if let v = vector {
-                    let novelty = Eye.novelty(of: v, against: self.recentVectors)
+                    let novelty = Salience.novelty(of: v, against: self.recentVectors)
                     escalate = self.lastText.isEmpty || novelty >= self.noveltyThreshold
                     self.recentVectors.append(v)
                     if self.recentVectors.count > self.recentWindow {
@@ -140,20 +140,6 @@ final class Eye {
                 EyeSignals.shared.publishStatus("screen capture blocked - grant Screen Recording in System Settings")
             }
         }
-    }
-
-    // Novelty = 1 - cosine(current, centroid of recent). 1.0 (max) when there is
-    // no history yet, so the first frame always reads as new.
-    static func novelty(of vector: [Double], against recent: [[Double]]) -> Double {
-        guard !recent.isEmpty else { return 1.0 }
-        let dims = vector.count
-        guard dims > 0 else { return 1.0 }
-        var centroid = [Double](repeating: 0, count: dims)
-        for v in recent {
-            for i in 0..<min(dims, v.count) { centroid[i] += v[i] }
-        }
-        for i in 0..<dims { centroid[i] /= Double(recent.count) }
-        return 1.0 - TextEmbedder.cosine(vector, centroid)
     }
 
     // Cheap change magnitude in [0, 1]: 1 - (shared prefix + suffix) / max length.

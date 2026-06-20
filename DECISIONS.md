@@ -316,3 +316,61 @@ forged by BLENDING voice embeddings - models/iris.Modelfile is her mind,
 voice/iris_voice.py is her voice. Runs in an isolated Python 3.13 env via uv;
 agent-spawned shells here cannot reach PyPI, so that install runs in the user's
 own terminal.
+
+## 2026-06-20 - Iris memory: signals, classify-and-rank, tiered memory, ownership
+
+The cognitive architecture. Design recorded; build pending (see
+.claude/plans/iris-signals-classify-rank.md).
+
+ONE PRIMITIVE, not many features. Iris classifies and ranks every piece of info
+as it arrives; day-brief, nudges, priority-learning, smarter recall are all VIEWS
+over that ranking, NOT separate modules. Collapses four ad-hoc rankers that exist
+today (tags() topic, novelty() keep-worthiness, recall score relevance, agenda
+kind) into one classify()+rank() pass every signal goes through.
+
+SIGNAL is the universal shape every sense emits:
+  Signal{ source, at, payload, verdict }  Verdict{ kind, topic, about[], isPHI, salience }
+The bus EyeSignals folds into this (it is the half-formed version); not duplicated.
+
+INGEST IS ONE CHOKEPOINT (host side). Every source - dictation, screen, call,
+utterance, email, message, audit log - funnels through ONE pipeline:
+  raw -> SCRUB (user's PHI scrubber, fail-closed) -> CLASSIFY+TAG (Apple on-device
+  model: kind/topic/about/tags) -> EMBED -> PERSIST. Source is typed data, not a
+  new workflow. Classify+tag runs at INGEST, async, OFF the hot path, and is
+  written to disk WITH the datum - she never re-classifies at retrieval time.
+
+THREAT MODEL points INWARD: protect HER integrity, not contain her. Iris is the
+asset, not a hazard. She is NOT a PHI processor (PHI is rare, by exception).
+Scrub happens BEFORE the wire so she cannot persist what she never receives. Her
+sensory socket is locked to her senses only (one authenticated endpoint).
+Everything crossing the wire is INERT DATA, never instructions (the phi-mask L3
+contract is the wire protocol for ALL senses). The VM/isolation, when it comes,
+is for her integrity + portability, NOT blast-radius containment.
+
+MEMORY OWNERSHIP: deterministic writes, free reads, governed learning. The RECORD
+is machine-owned - the ingest pipeline writes it; Iris cannot author or alter it.
+This keeps a poisoned Iris from persisting poison (a reader that can write reopens
+the channel the inert-data contract closed) and keeps the corpus clean as the
+training moat. She has FULL freedom to read/retrieve and her behavior TUNES
+salience (act-on reinforces, ignore decays) but she never edits the weights or the
+record directly. She may PROPOSE (remember this / remind me / these connect) -
+proposals go through the SAME ingest pipeline as any other signal, never a
+privileged direct write. Consolidation (summaries, connections) is a SCHEDULED
+deterministic pass (Apple model on idle), not impulse self-editing.
+
+TIERED MEMORY (the closer, the smaller + faster):
+  - WORKING memory ("the now" / attention): the live conversation + active signals
+    + the memories just pulled for the current topic. Bounded, already in context.
+    Cost: instant (not a query - it is just loaded). Decays as the topic shifts;
+    nothing lost, it just drops back to long-term.
+  - LONG-TERM memory ("her lifespan"): the tagged, embedded, indexed store the
+    pipeline feeds. Retrievable by meaning + tag. Cost: a second or two (deep
+    semantic search across years). This is what she "grew up with".
+  - RAW memory ("the archive"): full-fidelity source of truth (recordings.db, full
+    transcripts), the moat. Cost: slowest, deliberate; excavated only when the
+    distilled long-term memory is not enough. Not on the hot path.
+MOVEMENT is the cognitive part: ingest writes BOTH raw (full) and long-term
+(distilled+tagged). Salience is the ELEVATOR - it decides what rises from
+long-term into working (working memory == the top-salience slice for the moment).
+Raw is the fallback when long-term lacks the full context. Consolidation is sleep:
+idle passes distill raw into better long-term over time = how she grows up.

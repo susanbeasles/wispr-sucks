@@ -174,6 +174,11 @@ final class IrisChat: NSObject {
 
         // Agenda commands - reliable, no LLM round-trip.
         let lower = text.lowercased()
+        if lower == "/brief" || lower == "/plan" || lower.contains("plan my day")
+            || lower.contains("brief me") || lower.contains("my day") {
+            showBrief()
+            return
+        }
         if lower == "/agenda" || lower == "/list" || lower.contains("what's on my list")
             || lower.contains("whats on my list") || lower.contains("my agenda")
             || lower.contains("my action items") || lower.contains("my to-do") || lower.contains("my todo") {
@@ -225,6 +230,37 @@ final class IrisChat: NSObject {
             let mark = it.kind == "task" ? "[ ]" : "  -"
             appendAttr("  \(mark) \(it.text)   (\(it.id))\n", color: .labelColor, bold: false)
         }
+    }
+
+    // The day-brief: the open agenda ordered by SALIENCE (Salience.base) - the
+    // first VIEW over the one classify-and-rank primitive. Not a bespoke planner:
+    // it is just the agenda sorted by how much each item should rise (kind weight
+    // plus staleness), so the thing that nags loudest sits on top. Nudges will
+    // reuse this exact ranking, conditioned on the moment instead of the whole day.
+    private func showBrief() {
+        let items = agenda?.open() ?? []
+        guard !items.isEmpty else {
+            appendAttr("(nothing on your plate - your list is empty)\n", color: .secondaryLabelColor, bold: false)
+            return
+        }
+        let now = Date()
+        let ranked = items
+            .map { (item: $0, score: Salience.base(kind: Self.salienceKind($0.kind),
+                                                   age: now.timeIntervalSince($0.createdAt))) }
+            .sorted { $0.score > $1.score }
+
+        appendAttr("Your day - \(ranked.count) open, most pressing first:\n",
+                   color: NSColor.systemIndigo, bold: true)
+        for (i, r) in ranked.enumerated() {
+            let mark = r.item.kind == "task" ? "[ ]" : "  -"
+            appendAttr("  \(i + 1). \(mark) \(r.item.text)\n", color: .labelColor, bold: false)
+        }
+    }
+
+    // Map an agenda item's kind onto the salience taxonomy. A task is an action
+    // (something to do); a note is a fact (something to remember).
+    private static func salienceKind(_ agendaKind: String) -> Salience.Kind {
+        agendaKind == "note" ? .fact : .action
     }
 
     // Auto-capture action items / notes from a message (background, conservative).
