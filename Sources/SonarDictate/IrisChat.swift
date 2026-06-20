@@ -21,6 +21,7 @@ final class IrisChat: NSObject {
     private var history: [[String: String]] = []   // conversation turns, for context
     private var recentCall: [String] = []           // rolling call transcript (her ears -> her context)
     private var busy = false
+    private var voiceOn = true   // she speaks her replies aloud; /mute to silence
     // Track the last call line so a growing utterance REPLACES it instead of
     // printing "Hey", "Hey there", "Hey there friend" as three lines.
     private var lastCallStart = -1
@@ -174,6 +175,18 @@ final class IrisChat: NSObject {
 
         // Agenda commands - reliable, no LLM round-trip.
         let lower = text.lowercased()
+        if lower == "/mute" || lower == "/quiet" {
+            voiceOn = false
+            appendAttr("[muted - she will not speak aloud]\n", color: .systemOrange, bold: false)
+            return
+        }
+        if lower == "/voice" || lower == "/unmute" || lower == "/speak" {
+            voiceOn = true
+            let line = IrisVoice.isAvailable
+                ? "[voice on]" : "[voice on - but not installed yet; run the venv install]"
+            appendAttr("\(line)\n", color: .systemGreen, bold: false)
+            return
+        }
         if lower == "/brief" || lower == "/plan" || lower.contains("plan my day")
             || lower.contains("brief me") || lower.contains("my day") {
             showBrief()
@@ -214,6 +227,7 @@ final class IrisChat: NSObject {
             } else {
                 self.history.append(["role": "assistant", "content": reply])
                 self.remember(reply, kind: "reply", tag: false)
+                if self.voiceOn { IrisVoice.speak(reply) }   // she says it aloud in her own voice
             }
         }
     }
