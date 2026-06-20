@@ -1425,6 +1425,19 @@ if #available(macOS 26.0, *) {
     irisChat.attach(memory: irisMemory, embedder: irisEmbedder)
     irisChat.install()
 
+    // Iris's ears: on-device dual-source call transcription (system audio + mic),
+    // separate from the sealed dictation path. Stage 1 streams the labeled
+    // transcript into her chat with a LISTENING marker so you can verify she hears.
+    let callListener = CallListener()
+    callListener.onSegment = { label, text in irisChat.appendCallSegment(label, text) }
+    callListener.onState = { on in irisChat.noteListening(on) }
+    callListener.onDiag = { text in irisChat.noteDiag(text) }
+    // Click-to-listen (the hotkey gets eaten by terminal Secure Keyboard Entry).
+    irisChat.onToggleListen = { Task { await callListener.toggle() } }
+    // Open her window at launch so there is always a clickable surface - no hotkey
+    // needed to reach the Listen button or talk to her.
+    irisChat.show()
+
     // Global hotkeys (mirror the app's other ctrl-opt hotkeys; they work because
     // the app holds Accessibility trust). Note: a terminal with Secure Keyboard
     // Entry focused will eat these - press them with another app focused.
@@ -1435,9 +1448,11 @@ if #available(macOS 26.0, *) {
             if eye.isWatching { irisChat.show() }
         } else if ctrlOpt, event.keyCode == 34 { // ctrl-opt-I -> talk to Iris
             irisChat.show()
+        } else if ctrlOpt, event.keyCode == 38 { // ctrl-opt-J -> Iris listens to the call
+            Task { await callListener.toggle() }
         }
     }
-    NSLog("SonarDictate: iris hotkeys installed (ctrl-opt-E watch, ctrl-opt-I talk)")
+    NSLog("SonarDictate: iris hotkeys installed (ctrl-opt-E watch, ctrl-opt-I talk, ctrl-opt-J listen)")
     // Warm Iris into RAM so her first reply is not the slow cold-load one.
     IrisClient.prewarm()
 

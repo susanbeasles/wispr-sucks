@@ -8,3 +8,9 @@ dist/
 
 # Playwright MCP scratch artifacts (not project code)
 .playwright-mcp/
+
+# Iris voice: venv + downloaded model are heavy/local; the script is tracked
+voice/.venv/
+voice/*.onnx
+voice/*.bin
+voice/out.wav

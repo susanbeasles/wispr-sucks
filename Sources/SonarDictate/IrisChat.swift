@@ -10,11 +10,22 @@ final class IrisChat: NSObject {
     private var window: NSWindow?
     private var textView: NSTextView?
     private var input: NSTextField?
+    private var listenButton: NSButton?
+
+    // Click the Listen button -> toggle the call listener (reliable; no hotkey).
+    var onToggleListen: (() -> Void)?
 
     private weak var memory: PerceptionMemory?
     private var embedder: TextEmbedder?
     private var history: [[String: String]] = []   // conversation turns, for context
+    private var recentCall: [String] = []           // rolling call transcript (her ears -> her context)
     private var busy = false
+    // Track the last call line so a growing utterance REPLACES it instead of
+    // printing "Hey", "Hey there", "Hey there friend" as three lines.
+    private var lastCallStart = -1
+    private var lastCallLen = 0
+    private var lastCallText = ""
+    private var lastCallLabel = ""
 
     func attach(memory: PerceptionMemory?, embedder: TextEmbedder?) {
         self.memory = memory
@@ -30,6 +41,62 @@ final class IrisChat: NSObject {
             NSApp.activate(ignoringOtherApps: true)
             if let i = self.input { self.window?.makeFirstResponder(i) }
         }
+    }
+
+    // MARK: - Call listening (her ears)
+
+    // Dead-obvious listening state: the window title + a clear marker line, so you
+    // never think she's listening when she is not.
+    func noteListening(_ on: Bool) {
+        DispatchQueue.main.async {
+            self.ensureWindow()
+            self.window?.title = on ? "Iris - LISTENING (call)" : "Iris"
+            self.listenButton?.title = on ? "Stop" : "Listen"
+            self.appendAttr(on ? "--- LISTENING: system audio + your mic ---\n"
+                               : "--- stopped listening ---\n",
+                            color: on ? .systemGreen : .systemOrange, bold: true)
+            if on { self.show() }
+        }
+    }
+
+    // A transcript segment from the call (label = "you" / "them"). If it just
+    // EXTENDS the last call line (same speaker, still mid-utterance) it replaces
+    // that line; otherwise it starts a new one. The length check ensures we only
+    // replace when nothing else (a reply, a marker) was printed in between.
+    func appendCallSegment(_ label: String, _ text: String) {
+        DispatchQueue.main.async {
+            guard let tv = self.textView, let storage = tv.textStorage else { return }
+
+            let canReplace = self.lastCallStart >= 0
+                && self.lastCallLabel == label
+                && text.hasPrefix(self.lastCallText)
+                && storage.length == self.lastCallStart + self.lastCallLen
+            if canReplace {
+                storage.deleteCharacters(in: NSRange(location: self.lastCallStart, length: self.lastCallLen))
+                // The growing line supersedes the partial we recorded for context.
+                if !self.recentCall.isEmpty { self.recentCall.removeLast() }
+            }
+
+            let start = storage.length
+            let color: NSColor = (label == "you") ? .systemTeal : .systemPurple
+            storage.append(NSAttributedString(string: "\(label)  ",
+                attributes: [.foregroundColor: color, .font: NSFont.boldSystemFont(ofSize: 12)]))
+            storage.append(NSAttributedString(string: text + "\n",
+                attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.systemFont(ofSize: 13)]))
+
+            self.lastCallStart = start
+            self.lastCallLen = storage.length - start
+            self.lastCallText = text
+            self.lastCallLabel = label
+            self.recentCall.append("\(label): \(text)")
+            if self.recentCall.count > 40 { self.recentCall.removeFirst(self.recentCall.count - 40) }
+            tv.scrollToEndOfDocument(nil)
+        }
+    }
+
+    // Live, content-free capture counts in the title (no CLI/log, no prompts).
+    func noteDiag(_ text: String) {
+        DispatchQueue.main.async { self.window?.title = "Iris - LISTENING  [\(text)]" }
     }
 
     // MARK: - Build
@@ -63,7 +130,7 @@ final class IrisChat: NSObject {
         container.addSubview(scroll)
         self.textView = tv
 
-        let field = NSTextField(frame: NSRect(x: 8, y: 8, width: 404, height: 28))
+        let field = NSTextField(frame: NSRect(x: 8, y: 8, width: 312, height: 28))
         field.placeholderString = "Talk to Iris..."
         field.autoresizingMask = [.width]
         field.bezelStyle = .roundedBezel
@@ -72,6 +139,16 @@ final class IrisChat: NSObject {
         container.addSubview(field)
         self.input = field
 
+        let listen = NSButton(frame: NSRect(x: 328, y: 8, width: 84, height: 28))
+        listen.title = "Listen"
+        listen.bezelStyle = .rounded
+        listen.autoresizingMask = [.minXMargin]
+        listen.target = self
+        listen.action = #selector(handleListen)
+        listen.toolTip = "Iris listens to the call (system audio + your mic)"
+        container.addSubview(listen)
+        self.listenButton = listen
+
         w.contentView = container
         self.window = w
         appendAttr("Iris is here - watching quietly, remembering. Talk to her.\n\n",
@@ -79,6 +156,10 @@ final class IrisChat: NSObject {
     }
 
     // MARK: - Send
+
+    @objc private func handleListen() {
+        onToggleListen?()
+    }
 
     @objc private func handleSend() {
         guard let input, !busy else { return }
@@ -116,6 +197,10 @@ final class IrisChat: NSObject {
         let screen = EyeSignals.shared.snapshot().latestObservation
         if !screen.isEmpty {
             parts.append("(On screen right now: \(String(screen.prefix(500))))")
+        }
+        if !recentCall.isEmpty {
+            let lines = recentCall.suffix(24).joined(separator: "\n")
+            parts.append("(You are listening to a live call. This is what you have heard - 'you' is the user you are helping, 'them' is the other party. This IS your hearing; do not deny you can hear:\n\(lines))")
         }
         if let memory, let embedder, let v = try? embedder.vector(for: text) {
             let hits = memory.recall(vector: v, k: 4).filter { $0.score > 0.3 }

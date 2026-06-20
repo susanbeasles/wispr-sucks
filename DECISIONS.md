@@ -287,3 +287,32 @@ The eyes peripheral became "Iris," a companion. Decisions:
 
 PHI: entirely on-device. ollama is localhost-only; nothing leaves the box; the
 memory is AES-GCM encrypted at rest; no frame / OCR / summary in cleartext logs.
+
+## 2026-06-19 - Iris ears: on-device dual-source call transcription
+
+Iris can listen to a call - both sides - on-device, SEPARATE from the sealed
+dictation path (no change to SpeechAnalyzerSession).
+- CallTranscriber: a standalone SpeechAnalyzer + DictationTranscriber per source,
+  mirroring the sealed setup (bestAvailableAudioFormat + AVAudioConverter +
+  AnalyzerInput stream). A live call rarely yields a "final" result (there is no
+  push-to-talk release), so a segment commits on a ~1.1s speech PAUSE; a growing
+  utterance REPLACES its line in the UI instead of printing each partial.
+- CallListener: mic (you) via AVAudioEngine + system audio (them) via
+  ScreenCaptureKit (capturesAudio, excludesCurrentProcessAudio); routes each to its
+  transcriber, labels segments you/them.
+- Surfaced in the IrisChat window with a click "Listen" button (global hotkeys are
+  eaten by a terminal's Secure Keyboard Entry) and a content-free live indicator in
+  the window TITLE (sys buffers / results / segments / errors).
+- LESSON (load-bearing): do NOT diagnose via repeated `sonar-dictate logs` CLI
+  reads. Each cold CLI process re-authenticates to the Secure Enclave / keychain
+  the encrypted log is keyed to and prompts Touch ID / password EVERY time - it
+  flooded the user with ~80 prompts. Diagnose through the app UI (the title
+  indicator), not the CLI log.
+- Consent/PHI: capturing system audio records the other party; the USER owns
+  consent. All on-device; the listener persists nothing.
+
+Voice (in progress): a UNIQUE on-device neural voice via Kokoro (kokoro-onnx),
+forged by BLENDING voice embeddings - models/iris.Modelfile is her mind,
+voice/iris_voice.py is her voice. Runs in an isolated Python 3.13 env via uv;
+agent-spawned shells here cannot reach PyPI, so that install runs in the user's
+own terminal.
