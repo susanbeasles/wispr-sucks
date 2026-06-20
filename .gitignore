@@ -14,3 +14,8 @@ voice/.venv/
 voice/*.onnx
 voice/*.bin
 voice/out.wav
+# Audition scratch: rendered samples + the candidate log are local artifacts.
+# Her CHOSEN voice (voice/iris_voice.json) IS tracked - it is her identity.
+voice/__pycache__/
+voice/audition_*.wav
+voice/audition_options.json

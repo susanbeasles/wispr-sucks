@@ -1,0 +1,16 @@
+{
+  "blend": [
+    {
+      "voice": "af_heart",
+      "weight": 0.7
+    },
+    {
+      "voice": "af_bella",
+      "weight": 0.3
+    }
+  ],
+  "speed": 1.0,
+  "why": "grounded and calming",
+  "label": "mix:Grounded Harmony",
+  "chosen_at": "2026-06-20T08:07:20"
+}
