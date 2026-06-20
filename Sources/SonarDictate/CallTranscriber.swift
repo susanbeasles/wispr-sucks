@@ -23,6 +23,13 @@ final class CallTranscriber {
     private var analyzerTask: Task<Void, Never>?
     private var pending = ""
     private var flushTask: Task<Void, Never>?
+    // Voice-activity gate: recognizers HALLUCINATE plausible phrases from silence
+    // / background hiss. Only feed audio above a noise floor (plus a short
+    // hangover so quiet syllables are not clipped); sustained silence feeds
+    // nothing, so it can invent nothing.
+    private var hangover = 0
+    private let hangoverBuffers = 12      // ~0.5s of trailing audio after the last loud buffer
+    private let energyFloor: Float = 0.012
 
     var onSegment: ((String, String) -> Void)?
     var onResult: (() -> Void)?          // any result (volatile or final) - proves the analyzer is alive
@@ -105,6 +112,11 @@ final class CallTranscriber {
     // Feed one audio buffer (realtime thread). Converts to the analyzer format first.
     func append(_ buffer: AVAudioPCMBuffer) {
         guard let continuation else { return }
+        // Voice-activity gate: only feed real sound (+ a short hangover). Silence
+        // in -> nothing fed -> no hallucinated phantom transcript.
+        if Self.rms(buffer) >= energyFloor { hangover = hangoverBuffers }
+        guard hangover > 0 else { return }
+        hangover -= 1
         if let converter, let outFormat = analyzerFormat,
            let converted = Self.convert(buffer, with: converter, to: outFormat) {
             continuation.yield(AnalyzerInput(buffer: converted))
@@ -148,6 +160,25 @@ final class CallTranscriber {
         analyzer = nil
         converter = nil
         analyzerFormat = nil
+    }
+
+    // Root-mean-square level of a buffer in [0, ~1]. Handles float32 and int16.
+    private static func rms(_ b: AVAudioPCMBuffer) -> Float {
+        let n = Int(b.frameLength)
+        guard n > 0 else { return 0 }
+        if let ch = b.floatChannelData {
+            let data = ch[0]
+            var sum: Float = 0
+            for i in 0..<n { let s = data[i]; sum += s * s }
+            return (sum / Float(n)).squareRoot()
+        }
+        if let ch = b.int16ChannelData {
+            let data = ch[0]
+            var sum: Float = 0
+            for i in 0..<n { let s = Float(data[i]) / 32768.0; sum += s * s }
+            return (sum / Float(n)).squareRoot()
+        }
+        return 1   // unknown format: do not gate
     }
 
     private static func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, to outFormat: AVAudioFormat) -> AVAudioPCMBuffer? {

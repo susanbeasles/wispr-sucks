@@ -16,6 +16,7 @@ final class IrisChat: NSObject {
     var onToggleListen: (() -> Void)?
 
     private weak var memory: PerceptionMemory?
+    private weak var agenda: AgendaStore?
     private var embedder: TextEmbedder?
     private var history: [[String: String]] = []   // conversation turns, for context
     private var recentCall: [String] = []           // rolling call transcript (her ears -> her context)
@@ -27,9 +28,10 @@ final class IrisChat: NSObject {
     private var lastCallText = ""
     private var lastCallLabel = ""
 
-    func attach(memory: PerceptionMemory?, embedder: TextEmbedder?) {
+    func attach(memory: PerceptionMemory?, embedder: TextEmbedder?, agenda: AgendaStore?) {
         self.memory = memory
         self.embedder = embedder
+        self.agenda = agenda
     }
 
     func install() { DispatchQueue.main.async { self.ensureWindow() } }
@@ -169,7 +171,27 @@ final class IrisChat: NSObject {
 
         appendAttr("you  ", color: .systemTeal, bold: true)
         appendAttr(text + "\n", color: .labelColor, bold: false)
+
+        // Agenda commands - reliable, no LLM round-trip.
+        let lower = text.lowercased()
+        if lower == "/agenda" || lower == "/list" || lower.contains("what's on my list")
+            || lower.contains("whats on my list") || lower.contains("my agenda")
+            || lower.contains("my action items") || lower.contains("my to-do") || lower.contains("my todo") {
+            showAgenda()
+            return
+        }
+        if lower.hasPrefix("done ") || lower.hasPrefix("/done ") {
+            let needle = String(text.dropFirst(lower.hasPrefix("/done ") ? 6 : 5))
+            if let item = agenda?.complete(needle) {
+                appendAttr("[done] \(item.text)\n", color: .systemGreen, bold: false)
+            } else {
+                appendAttr("[nothing open matched \"\(needle)\"]\n", color: .systemOrange, bold: false)
+            }
+            return
+        }
+
         remember(text, kind: "utterance", tag: true)
+        captureAgenda(text)   // auto-extract action items / notes (background, conservative)
 
         history.append(["role": "user", "content": contextualize(text)])
         busy = true
@@ -191,9 +213,39 @@ final class IrisChat: NSObject {
         }
     }
 
+    // Show the open agenda directly (no LLM - reliable).
+    private func showAgenda() {
+        let items = agenda?.open() ?? []
+        guard !items.isEmpty else {
+            appendAttr("(your list is empty)\n", color: .secondaryLabelColor, bold: false)
+            return
+        }
+        appendAttr("Your list - \(items.count) open:\n", color: NSColor.systemIndigo, bold: true)
+        for it in items {
+            let mark = it.kind == "task" ? "[ ]" : "  -"
+            appendAttr("  \(mark) \(it.text)   (\(it.id))\n", color: .labelColor, bold: false)
+        }
+    }
+
+    // Auto-capture action items / notes from a message (background, conservative).
+    private func captureAgenda(_ text: String) {
+        guard let agenda else { return }
+        Task { @MainActor in
+            let items = await IrisClient.extractAgenda(from: text)
+            for it in items {
+                let added = agenda.add(kind: it.kind, text: it.text)
+                self.appendAttr("[+\(added.kind)] \(added.text)\n", color: .systemTeal, bold: false)
+            }
+        }
+    }
+
     // Build the user turn with her context: what she sees now + what she remembers.
     private func contextualize(_ text: String) -> String {
         var parts: [String] = []
+        if let open = agenda?.open(), !open.isEmpty {
+            let lines = open.prefix(20).map { "- [\($0.kind)] \($0.text)" }.joined(separator: "\n")
+            parts.append("(The user's current open agenda - their tasks and notes. Use this when relevant:\n\(lines))")
+        }
         let screen = EyeSignals.shared.snapshot().latestObservation
         if !screen.isEmpty {
             parts.append("(On screen right now: \(String(screen.prefix(500))))")

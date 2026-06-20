@@ -36,6 +36,33 @@ enum IrisClient {
         return out
     }
 
+    // Pull concrete action items / notes out of a message. Conservative; returns
+    // [] when there is nothing actionable. Used to auto-fill the Agenda.
+    static func extractAgenda(from message: String) async -> [(kind: String, text: String)] {
+        let prompt = """
+        From the user's message, extract concrete ACTION ITEMS (things they need to do) \
+        and NOTES (facts worth remembering for them). Be conservative - only clear, \
+        real ones; skip small talk and questions.
+        Output ONLY a JSON array like [{"kind":"task","text":"..."},{"kind":"note","text":"..."}]. \
+        If there are none, output [].
+        Message: \(message)
+        """
+        guard let r = await complete(prompt),
+              let start = r.firstIndex(of: "["), let end = r.lastIndex(of: "]"), start < end else { return [] }
+        let json = String(r[start...end])
+        guard let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        var out: [(kind: String, text: String)] = []
+        for obj in arr {
+            guard let text = (obj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else { continue }
+            let kind = ((obj["kind"] as? String)?.lowercased() == "note") ? "note" : "task"
+            out.append((kind, text))
+            if out.count >= 5 { break }
+        }
+        return out
+    }
+
     // One non-streaming chat call; nil on any failure so callers can fall back.
     private static func chatOnce(_ messages: [[String: String]]) async -> String? {
         var request = URLRequest(url: endpoint)

@@ -1412,6 +1412,9 @@ if #available(macOS 26.0, *) {
     // memory is Iris's brain.
     let irisEmbedder = try? TextEmbedder()
     let irisMemory = try? PerceptionMemory()
+    // Her agenda: the structured action-items + notes layer (encrypted). The
+    // assistant primitive everything else grows from.
+    let irisAgenda = try? AgendaStore()
 
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
@@ -1422,7 +1425,7 @@ if #available(macOS 26.0, *) {
     // Iris's conversation surface - the ONLY place she speaks, and only when
     // spoken to. Shares the memory the eyes fill.
     let irisChat = IrisChat()
-    irisChat.attach(memory: irisMemory, embedder: irisEmbedder)
+    irisChat.attach(memory: irisMemory, embedder: irisEmbedder, agenda: irisAgenda)
     irisChat.install()
 
     // Iris's ears: on-device dual-source call transcription (system audio + mic),
@@ -1455,6 +1458,27 @@ if #available(macOS 26.0, *) {
     NSLog("SonarDictate: iris hotkeys installed (ctrl-opt-E watch, ctrl-opt-I talk, ctrl-opt-J listen)")
     // Warm Iris into RAM so her first reply is not the slow cold-load one.
     IrisClient.prewarm()
+
+    // Minimal main menu. An LSUIElement (menu-bar-only) app has NO menu bar of its
+    // own, so the standard Edit shortcuts (Cmd-A select-all, Cmd-C copy, Cmd-V
+    // paste, Cmd-X cut) were never bound - they do nothing in her text fields.
+    // Wiring an Edit menu routes them through the responder chain to the focused
+    // text view, so you can select/copy the transcript like any normal window.
+    let mainMenu = NSMenu()
+    let appMenuItem = NSMenuItem()
+    mainMenu.addItem(appMenuItem)
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "Quit Iris", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appMenuItem.submenu = appMenu
+    let editMenuItem = NSMenuItem()
+    mainMenu.addItem(editMenuItem)
+    let editMenu = NSMenu(title: "Edit")
+    editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editMenuItem.submenu = editMenu
+    NSApp.mainMenu = mainMenu
 
     dictator.bootstrap()
     // Warm the speech model in the background at launch (no mic) so the FIRST
