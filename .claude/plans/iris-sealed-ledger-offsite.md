@@ -10,33 +10,33 @@ corpus, session logs - cryptographically SEALED and CHAINED together
 device but stored, RECOVERABLE, to two homes (Dropbox 10TB bulk; Cloudflare R2
 edge). Zero-knowledge: the clouds hold only ciphertext, never a key.
 
-## Split brain (the routing principle - owner's keystone)
+## ONE brain, partitioned RAW (owner's keystone - corrected)
 
-"What she LEARNS is kept. The actual DATA is not." A learning is not the document
-it came from. The brain splits along JURISDICTION, decided at ingest:
+NOT a "split brain." The BRAIN does not split. The brain + everything she LEARNS
+is Susan's: unified, recoverable, backed up. What splits is the RAW DATA, by who
+OWNS it:
 
-- WORK-raw  -> WORK infrastructure ONLY. Company data (SonarMD's, not his) is
-  stored only on work infra; it NEVER touches personal Dropbox/R2. The company's
-  legitimate concern is answered structurally, not by promise.
-- PERSONAL-raw -> personal infra (his homes).
-- LEARNINGS -> kept, central, hers - free game regardless of source. Patterns,
-  preferences, relationships, KEY PHRASES, salience weights she ABSTRACTS from
-  either side are knowledge, not data. Kept because she learned them.
+- COMPANY RAW (Sonar's: assets, secrets, PHI, business-ops workflows) -> sealed
+  under the SECURE ENCLAVE key (EnclaveBox). Device-bound; the SEP key cannot be
+  exported, so company raw stays locked to this machine, stays Sonar's, NEVER
+  leaves readable, NEVER rides up to personal backups.
+- PERSONAL RAW (his life, day-to-day) -> sealed under the RECOVERABLE key
+  (LedgerKey). His; backed up to his homes; restorable.
+- THE ONE BRAIN / LEARNINGS (from BOTH raw sides) -> Susan's, recoverable, backed
+  up. Only ABSTRACTIONS cross up - gist / key phrase / preference / relation /
+  weight - NEVER raw. A learning is not the document it came from.
 
-THE BOUNDARY (same gate-shape as phi-mask, pointed at confidentiality instead of
-PHI): work-confidential raw is ABSTRACTED before a learning crosses into the kept
-layer. Only abstractions cross - a key phrase, a preference, a relation, a weight.
-NEVER the raw work payload verbatim. If a "learning" reproduces the document, it
-is not a learning and it does not cross. This is data minimization - the thing
-privacy frameworks actually bless. The abstraction boundary is the whole ballgame:
-too-verbatim learnings smuggle work data into the personal layer. The learning
-layer has a DEFINED vocabulary of what may cross (gist / key phrase / preference /
-relation / weight); raw stays home.
+THE LEARNING GATE (same gate-shape as phi-mask, pointed at confidentiality): raw
+is abstracted before a learning enters the brain. If a "learning" reproduces the
+document it is not a learning and it does not cross. This is what lets her learn
+from the work side while the company's raw never becomes personal bytes.
 
-JURISDICTION becomes a first-class classify dimension (next to kind/topic/about/
-salience) and, unlike the others, it ROUTES STORAGE. The sealed ledger is
-PER-JURISDICTION chains with per-jurisdiction replication: work chain -> work
-infra only; personal chain -> his homes; learning layer = its own kept spine.
+TWO KEY REGIMES, ONE LEDGER (the only generalization needed): the per-chain key
+WRAP is pluggable - Enclave-wrap (EnclaveBox) for the company-raw chain
+(device-bound), recoverable-wrap (LedgerKey KEK) for personal raw + the brain
+(backed up). Two genuine uses, not a rewrite. Replication: personal raw + brain
+-> his homes (R2/Dropbox); company raw -> NOT replicated (Enclave-sealed, stays on
+the device by construction).
 
 ## Architecture
 
@@ -46,36 +46,39 @@ SEALED LEDGER. Append-only chain of records. Each record:
 Tamper-evident: altering/dropping any record breaks the chain from there on. A
 `verify` walks the chain and proves it is unbroken (audit posture).
 
-RECOVERABLE ENVELOPE ENCRYPTION (the key change from today's posture):
-- Per-record data key (random) seals the payload (AES-256-GCM).
-- Data keys wrapped by a MASTER key (KEK).
-- The KEK is RECOVERABLE: passphrase-derived (scrypt/PBKDF2, high cost) and/or
-  escrowed - NOT the Secure Enclave (Enclave keys cannot leave the chip, so an
-  off-device copy sealed by Enclave is unrecoverable; owner chose recoverable).
-- Her brain is re-keyed off Enclave-only onto this recoverable wrap FOR THE BACKUP
-  copy. (Local-only fast path may still use Enclave; the exported chain uses the
-  recoverable KEK.)
-- Recovery = new device + passphrase + off-device ciphertext -> full restore.
+ENVELOPE ENCRYPTION, TWO KEY REGIMES (per-record data key seals the payload
+AES-256-GCM; the data key is WRAPPED - the wrap is what differs by chain):
+- COMPANY-RAW chain -> ENCLAVE wrap (EnclaveBox / SEP key). Device-bound; the key
+  cannot leave the chip. NOT recoverable off-device - which is correct: it is
+  Sonar's, stays locked to the machine, never replicated.
+- PERSONAL-RAW chain + the BRAIN/LEARNING chain -> RECOVERABLE wrap (LedgerKey KEK,
+  passphrase-derived PBKDF2, high cost). His; backed up; restorable on a new
+  device with the passphrase.
+- The wrap is the ONLY thing that varies (a pluggable KeyWrap: EnclaveWrap vs
+  RecoverableWrap). Two genuine uses, not a rewrite.
 
-ZERO-KNOWLEDGE REPLICATION, routed BY JURISDICTION behind ONE adapter interface:
-- PERSONAL chain + LEARNING spine -> his homes:
+ZERO-KNOWLEDGE REPLICATION behind ONE adapter interface:
+- PERSONAL-RAW + BRAIN/LEARNING (recoverable-wrapped) -> his homes:
   - Cloudflare R2 - edge / immediate read. Free tier: ~10 GB-month storage, ~1M
     Class A + 10M Class B ops/month, EGRESS FREE. Domain already in the CF account.
   - Dropbox (10TB) - bulk archive, incl. heavy personal corpus audio.
-- WORK chain -> WORK infra ONLY (never personal). Target TBD (SonarMD-controlled).
-- All store ciphertext ONLY; no key ever leaves the device. Work raw NEVER routes
-  to a personal target - enforced at the adapter, not by convention.
+- COMPANY-RAW (Enclave-wrapped) -> NOT replicated. Device-bound by construction
+  (the SEP key cannot leave), so it physically cannot ride to a personal target.
+- All store ciphertext ONLY; no key ever leaves the device.
 
-## What this is (and is NOT)
+## What rides off-device (and what never does)
 
-This is PERSONAL BACKUP of the owner's OWN encrypted data - NOT a PHI-to-cloud
-compliance project. Iris never stores PHI: the scrubber is the gate in front of
-ingestion, so patient/client/customer PHI never enters her stores. What is in
-the ledger is the owner's own data + PII of people in his life. Sealed with HIS
-key, the clouds hold ciphertext only he can open. "Off device" here does NOT mean
-"exposed" - zero-knowledge breaks that link; off-device AND yours-only. The single
-device only adds one risk a backup removes: a dead Mac = her brain + the corpus
-gone forever.
+Only the RECOVERABLE-wrapped chains ride off-device: PERSONAL RAW (his own data +
+PII of people in his life) and the BRAIN/LEARNINGS (Susan's, abstractions only).
+That is PERSONAL BACKUP of his OWN encrypted data - sealed with HIS key, the clouds
+hold ciphertext only he can open. Her brain holds NO PHI and NO raw company data:
+the scrubber gates ingestion and the learning gate lets only abstractions cross.
+
+The COMPANY-RAW vault (Enclave/SEP-sealed) may contain sensitive Sonar data
+(secrets, PHI, business-ops) - but it NEVER rides off-device (the SEP key cannot
+leave), never becomes personal bytes, and only abstracted learnings derived from
+it enter the one brain. So "off device" is never "exposed": zero-knowledge for the
+personal backup, and physically-device-bound for the company vault.
 
 ## HARD GATES (do not bypass)
 
@@ -97,17 +100,20 @@ gone forever.
    that walks the chain and proves integrity + `restore(passphrase)`. Recoverable
    KEK (passphrase-wrapped). Unit-test: append N, verify ok; tamper one, verify
    fails at that seq; restore round-trips bytes.
-2. JURISDICTION at classify + the LEARNING gate: tag each artifact work/personal
-   at ingest (routes the chain); define the learning-abstraction boundary (what
-   may cross from work-raw into the kept learning spine: gist/key-phrase/
-   preference/relation/weight - never raw). Learning spine = its own chain.
+2. KEY REGIMES + ownership routing: pluggable KeyWrap (EnclaveWrap for company-raw,
+   RecoverableWrap for personal-raw + brain). Tag each artifact owner = company /
+   personal at ingest -> picks the chain + its wrap. Define the LEARNING gate (what
+   abstraction may cross from any raw into the one brain: gist/key-phrase/
+   preference/relation/weight - never raw). Brain/learning = its own recoverable
+   chain.
 3. MIGRATE artifacts INTO the ledger: EncryptedLog records, PerceptionMemory /
    AgendaStore / RAGIndex writes, recordings.db rows, session logs - each tagged
-   + routed. Preserve existing on-device fast paths.
-4. REPLICATION adapters behind one interface (put/list/get ciphertext objects),
-   ROUTED BY JURISDICTION: personal+learning -> R2 (edge) then Dropbox (bulk);
-   work -> work infra only (hard-enforced). Creds via op. Sync = push new chain
-   records since last cursor; the chain makes "what is new" exact.
+   by owner + routed to the right chain/wrap. Preserve existing on-device fast paths.
+4. REPLICATION adapters behind one interface (put/list/get ciphertext objects):
+   recoverable-wrapped chains (personal-raw + brain) -> R2 (edge) then Dropbox
+   (bulk); company-raw (Enclave-wrapped) -> NOT replicated (device-bound). Creds
+   via op. Sync = push new chain records since last cursor; the chain makes "what
+   is new" exact.
 
 ## PROGRESS
 
@@ -123,9 +129,27 @@ gone forever.
   decrypts, WRONG KEK cannot decrypt (zero-knowledge), chain verifies WITHOUT the
   key (hashes public), TAMPER (flipped byte) caught at exact seq, KDF determinism
   + different passphrase -> different key.
-- NOT yet wired into the app (slice 2/3): jurisdiction classification + the
-  learning gate, artifact migration, replication adapters. Ledger is destination-
-  and source-agnostic by design.
+- NOT yet wired into the app (slice 3): artifact migration, replication adapters.
+  Ledger is destination- and source-agnostic by design.
+
+2026-06-20 slice 2 (two seals + owner routing + learning gate) - DONE, builds
+clean, 13/13 tests pass:
+- KeyWrap.swift: KeyWrap protocol + RecoverableWrap (AES-GCM under LedgerKey KEK)
+  + EnclaveWrap (delegates to EnclaveBox / SEP). SealedLedger now takes a KeyWrap
+  (was a SymmetricKey); chain/format/verify unchanged.
+- Ledgers.swift: DataOwner {company, personal, brain} + TaggedRecord (provenance:
+  owner/source/kind/topic/tags/text) + the coordinator. company -> Enclave (device-
+  bound), personal + brain -> recoverable (backed up). Routing total + explicit.
+- LearningGate.swift: Learning {gist/keyPhrase/preference/relation/weight} +
+  LearningDeriver (injected) + LearningGate.admit - drops non-abstractions
+  (substring lift, contiguous run >= 6, mostly-a-lift, over-length). Only admitted
+  learnings reach the brain chain.
+- Verified: KeyWrap round-trips + zero-knowledge, EnclaveWrap over a real SE key,
+  owner routing (company=Enclave / personal+brain=recoverable, distinct chains),
+  company record decrypts via Enclave chain, gate admits abstraction / rejects
+  verbatim + over-length, only admitted reach brain, tamper caught at exact seq.
+- NOTE: verify() detects MODIFICATION, not tail TRUNCATION (hash-chain property;
+  truncation -> external head/height anchoring at the replication layer).
 
 ## Open decisions (resolve before/within slice 1)
 

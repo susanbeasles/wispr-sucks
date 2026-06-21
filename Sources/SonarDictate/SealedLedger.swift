@@ -19,7 +19,7 @@ import CryptoKit
 // never persists; only ciphertext does - so a backup of this file is opaque to
 // anyone without the passphrase, yet fully recoverable WITH it.
 final class SealedLedger {
-    private let kek: SymmetricKey
+    private let wrap: KeyWrap
     private let url: URL
     private let queue = DispatchQueue(label: "sonar-dictate.ledger")
     private var lastHash: Data
@@ -27,11 +27,12 @@ final class SealedLedger {
     private static let genesis = Data(repeating: 0, count: 32)
 
     // dir is injected (not hard-wired to SecureStore) so the ledger is unit
-    // testable against a temp directory.
-    init(jurisdiction: String, kek: SymmetricKey, dir: URL) throws {
-        self.kek = kek
+    // testable against a temp directory. `wrap` is the per-owner data-key seal
+    // (EnclaveWrap for company-raw, RecoverableWrap for personal-raw + brain).
+    init(name: String, wrap: KeyWrap, dir: URL) throws {
+        self.wrap = wrap
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.url = dir.appendingPathComponent("\(jurisdiction).chain")
+        self.url = dir.appendingPathComponent("\(name).chain")
 
         var seq: UInt64 = 0
         var head = Self.genesis
@@ -53,10 +54,10 @@ final class SealedLedger {
     func append(kind: String, payload: Data) throws -> UInt64 {
         try queue.sync {
             let dataKey = SymmetricKey(size: .bits256)
-            guard let sealed = try AES.GCM.seal(payload, using: dataKey).combined,
-                  let wrapped = try AES.GCM.seal(Self.raw(dataKey), using: kek).combined else {
+            guard let sealed = try AES.GCM.seal(payload, using: dataKey).combined else {
                 throw LedgerError.sealFailed
             }
+            let wrapped = try wrap.wrap(Self.raw(dataKey))
             let seq = lastSeq + 1
             let atMs = Int64(Date().timeIntervalSince1970 * 1000)
             let prefix = Self.prefix(seq: seq, atMs: atMs, prevHash: lastHash,
@@ -82,6 +83,12 @@ final class SealedLedger {
     // Walk the chain and prove it is unbroken: every recomputed hash matches,
     // every link points at its predecessor, sequence is dense from 1. Throws
     // chainBroken(seq) at the first failure.
+    //
+    // Detects MODIFICATION of any recorded content (the hash chain). It does NOT
+    // by itself detect TRUNCATION of the tail - dropping trailing records leaves a
+    // shorter chain that still verifies (a known hash-chain property). Truncation
+    // is caught by anchoring the head/height externally (the replication/backup
+    // layer records the expected height); out of scope for this on-device slice.
     func verify() throws {
         let blob = (try? Data(contentsOf: url)) ?? Data()
         var prev = Self.genesis
@@ -105,7 +112,7 @@ final class SealedLedger {
         var out: [LedgerEntry] = []
         for rec in Self.frames(blob) {
             let f = try Self.parse(rec)
-            let dataKeyData = try AES.GCM.open(AES.GCM.SealedBox(combined: f.wrapped), using: kek)
+            let dataKeyData = try wrap.unwrap(f.wrapped)
             let dataKey = SymmetricKey(data: dataKeyData)
             let payload = try AES.GCM.open(AES.GCM.SealedBox(combined: f.sealed), using: dataKey)
             out.append(LedgerEntry(seq: f.seq,
