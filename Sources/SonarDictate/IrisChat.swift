@@ -18,6 +18,11 @@ final class IrisChat: NSObject {
     private weak var memory: PerceptionMemory?
     private weak var agenda: AgendaStore?
     private var embedder: TextEmbedder?
+    // The owner-routed sealed ledger + her brain of learnings. Optional and used
+    // best-effort: if it is nil or any step fails, the chat is unaffected.
+    private var ledgers: Ledgers?
+    private let scrubber: Scrubber = PhiMaskScrubber()        // mandatory PHI gate
+    private let deriver: LearningDeriver = ModelLearningDeriver()
     private var history: [[String: String]] = []   // conversation turns, for context
     private var recentCall: [String] = []           // rolling call transcript (her ears -> her context)
     private var busy = false
@@ -29,10 +34,11 @@ final class IrisChat: NSObject {
     private var lastCallText = ""
     private var lastCallLabel = ""
 
-    func attach(memory: PerceptionMemory?, embedder: TextEmbedder?, agenda: AgendaStore?) {
+    func attach(memory: PerceptionMemory?, embedder: TextEmbedder?, agenda: AgendaStore?, ledgers: Ledgers?) {
         self.memory = memory
         self.embedder = embedder
         self.agenda = agenda
+        self.ledgers = ledgers
     }
 
     func install() { DispatchQueue.main.async { self.ensureWindow() } }
@@ -318,11 +324,27 @@ final class IrisChat: NSObject {
     // MARK: - Memory (her brain)
 
     private func remember(_ text: String, kind: String, tag: Bool) {
+        if kind != "reply" { ingestToLedger(text) }   // seal real input + learn (best-effort)
         guard let memory, let embedder else { return }
         Task.detached {
             guard let v = try? embedder.vector(for: text) else { return }
             let tags = tag ? await IrisClient.tags(for: text) : []
             try? memory.add(at: Date(), vector: v, summary: text, kind: kind, tags: tags)
+        }
+    }
+
+    // Seal what you said into the owner-routed ledger (PHI-scrubbed, classified by
+    // owner) and derive learnings into her brain. Fully detached, best-effort -
+    // never blocks the reply, never breaks the chat if the ledger/masker is absent.
+    private func ingestToLedger(_ text: String) {
+        guard let ledgers else { return }
+        let scrubber = self.scrubber
+        let deriver = self.deriver
+        Task.detached {
+            guard let record = try? Ingest.ingest(
+                SourceItem(source: "chat", provenance: .personal, at: Date(), text: text, externalId: nil),
+                scrub: scrubber, into: ledgers) else { return }
+            _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)
         }
     }
 

@@ -1416,6 +1416,20 @@ if #available(macOS 26.0, *) {
     // assistant primitive everything else grows from.
     let irisAgenda = try? AgendaStore()
 
+    // Iris's sealed ledger: owner-routed, tamper-evident raw + her brain of
+    // learnings. company -> Enclave seal (device-bound); personal + brain ->
+    // recoverable seal (the existing device key for now; LedgerKey passphrase
+    // derivation is the documented portable upgrade). Best-effort: if any of this
+    // fails to init, the rest of Iris runs unaffected.
+    let irisLedgers: Ledgers? = {
+        guard let kek = try? KeychainStore.loadOrCreateDBKey(),
+              let enclaveKey = try? EnclaveKey.loadOrCreate() else { return nil }
+        let dir = SecureStore.baseDir.appendingPathComponent("ledger", isDirectory: true)
+        let enclave = EnclaveWrap(box: EnclaveBox(
+            key: enclaveKey, salt: "__sonar_dictate_ledger_company__", info: "sonar-dictate.v1.ledger"))
+        return try? Ledgers(dir: dir, enclave: enclave, recoverable: RecoverableWrap(kek: kek))
+    }()
+
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)
@@ -1425,7 +1439,7 @@ if #available(macOS 26.0, *) {
     // Iris's conversation surface - the ONLY place she speaks, and only when
     // spoken to. Shares the memory the eyes fill.
     let irisChat = IrisChat()
-    irisChat.attach(memory: irisMemory, embedder: irisEmbedder, agenda: irisAgenda)
+    irisChat.attach(memory: irisMemory, embedder: irisEmbedder, agenda: irisAgenda, ledgers: irisLedgers)
     irisChat.install()
 
     // Iris's ears: on-device dual-source call transcription (system audio + mic),
