@@ -129,18 +129,21 @@ final class Dictator {
         // flag while it gets real-world validation - I/O audio cannot be unit-tested:
         //   IRIS_VOICE_ISOLATION=1
         if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] == "1" {
-            // VPIO is a DUPLEX unit - build the render (output) graph BEFORE enabling
-            // it, or the enable throws / capture stays broken. Touch output + mixer
-            // first, drive a silent render, THEN turn on voice processing.
+            // Write the result to a PLAINTEXT diag file (NSLog goes to the encrypted
+            // log, which is unreadable without the password-prompt flood). This lets
+            // the exact error be read directly.
+            let diag = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SonarDictate-vpio.txt")
+            func writeDiag(_ s: String) { try? s.write(toFile: diag, atomically: true, encoding: .utf8) }
             engine.mainMixerNode.outputVolume = 0
             _ = engine.outputNode
-            _ = engine.mainMixerNode
-            engine.prepare()
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
-                NSLog("SonarDictate: voice isolation ON (dictate over music); input format now \(engine.inputNode.outputFormat(forBus: 0))")
+                let fmt = engine.inputNode.outputFormat(forBus: 0)
+                writeDiag("VOICE ISOLATION: ON\ninput format: \(fmt)\nsampleRate \(fmt.sampleRate) ch \(fmt.channelCount)\n")
+                NSLog("SonarDictate: voice isolation ON; format \(fmt)")
             } catch {
-                NSLog("SonarDictate: voice isolation enable FAILED: \(error) :: \(error.localizedDescription)")
+                writeDiag("VOICE ISOLATION: FAILED\nerror: \(error)\ndesc: \(error.localizedDescription)\n")
+                NSLog("SonarDictate: voice isolation enable FAILED: \(error)")
             }
         }
 
