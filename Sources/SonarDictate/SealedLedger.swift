@@ -86,9 +86,8 @@ final class SealedLedger {
     //
     // Detects MODIFICATION of any recorded content (the hash chain). It does NOT
     // by itself detect TRUNCATION of the tail - dropping trailing records leaves a
-    // shorter chain that still verifies (a known hash-chain property). Truncation
-    // is caught by anchoring the head/height externally (the replication/backup
-    // layer records the expected height); out of scope for this on-device slice.
+    // shorter chain that still verifies (a known hash-chain property). Use
+    // verify(expecting:) with an externally-anchored head to catch truncation.
     func verify() throws {
         let blob = (try? Data(contentsOf: url)) ?? Data()
         var prev = Self.genesis
@@ -103,6 +102,22 @@ final class SealedLedger {
             }
             prev = f.thisHash
             expected += 1
+        }
+    }
+
+    // The chain's current tip: its height and head hash. A caller persists this in
+    // a separate trust root (Keychain, the replication manifest) so a later
+    // verify(expecting:) can detect a dropped or rewritten tail.
+    var head: ChainHead { queue.sync { ChainHead(height: lastSeq, hash: lastHash) } }
+
+    // verify() PLUS truncation/fork detection: the chain must end at exactly the
+    // anchored head. A truncated tail (height < expected) or a rewritten tip
+    // (height matches, hash differs) is caught here, where plain verify() passes.
+    func verify(expecting anchor: ChainHead) throws {
+        try verify()
+        let h = head
+        guard h.height == anchor.height, h.hash == anchor.hash else {
+            throw LedgerError.headMismatch(expected: anchor.height, found: h.height)
         }
     }
 
@@ -197,8 +212,16 @@ struct LedgerEntry {
     let payload: Data
 }
 
+// The chain's tip - height + head hash. Persisted in a separate trust root so a
+// dropped/rewritten tail is detectable via verify(expecting:).
+struct ChainHead: Codable, Equatable {
+    let height: UInt64
+    let hash: Data
+}
+
 enum LedgerError: Error, CustomStringConvertible {
     case chainBroken(seq: UInt64)
+    case headMismatch(expected: UInt64, found: UInt64)
     case badFrame
     case sealFailed
     case emptyPassphrase
@@ -207,6 +230,7 @@ enum LedgerError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .chainBroken(let seq): return "ledger chain broken at seq \(seq)"
+        case .headMismatch(let e, let f): return "ledger head mismatch: expected height \(e), found \(f)"
         case .badFrame:             return "ledger record malformed"
         case .sealFailed:           return "ledger AES-GCM seal failed"
         case .emptyPassphrase:      return "ledger passphrase is empty"
