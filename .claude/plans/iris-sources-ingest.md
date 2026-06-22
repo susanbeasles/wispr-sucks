@@ -64,6 +64,24 @@ Ingest - the one pipeline (reused by all sources):
 4. CURSORS + INCREMENTAL SYNC: persist per-source cursors so each fetch pulls only
    what is new; idempotent on externalId (no double-ingest).
 
+## PROGRESS
+
+2026-06-21: classifier + ingest spine - DONE, builds clean, 21/21 tests pass.
+- Classify.swift: Verdict {kind, owner, topic, about, tags, salience} + Classifier.
+  OWNER rule = provenance-first, fail-toward-protection: company/brain sticky
+  (never relaxed), personal escalates to company on a deterministic sensitive
+  marker. kind = lightweight heuristic (?, action cues, eye->observation, else
+  fact). salience reuses Salience.base.
+- Ingest.swift: SourceItem + Scrubber (mandatory, no default; IdentityScrubber is
+  a test double, prod = phi-mask) + Ingest.ingest = scrub -> classify -> route to
+  Ledgers by owner. One pipeline, all sources.
+- Verified: owner asymmetry (company never downgraded even on "private diary";
+  personal+PHI/confidential escalates), kind heuristic, end-to-end NO-BLEED -
+  a sensitive personal item lands in company and is absent from personal.
+- NEXT: model enrichment (topic/about/tags via IrisClient/Apple, off the safety
+  path); the Source adapter (fetch/cursor) for real connectors; learning
+  derivation (deriver -> existing LearningGate -> brain chain).
+
 ## Notes
 
 - Any company-owned source (if any are in scope at all) runs work-only, work-infra

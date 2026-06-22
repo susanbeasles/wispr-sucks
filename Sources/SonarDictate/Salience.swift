@@ -29,6 +29,16 @@ enum Salience {
             case .observation: return 0.25
             }
         }
+
+        // Stable string form for the stored record (TaggedRecord.kind).
+        var label: String {
+            switch self {
+            case .action:      return "action"
+            case .question:    return "question"
+            case .fact:        return "fact"
+            case .observation: return "observation"
+            }
+        }
     }
 
     // Base importance, precomputed at ingest: KIND weight plus a mild staleness
