@@ -1463,30 +1463,22 @@ if #available(macOS 26.0, *) {
         RunLoop.main.add(backupTimer, forMode: .common)
     }
 
-    // Messages ingestion (OPT-IN). If IRIS_INGEST_MESSAGES=1 and Full Disk Access
-    // is granted, poll new iMessages/SMS into the PERSONAL chain at launch + every
-    // 5 min, incrementally by ROWID cursor. Off by default - she does not read your
-    // messages unless you turn this on. Uses the sync deterministic Ingest (no
-    // model hammering on a bulk source); the scrubber still gates PHI.
-    if ProcessInfo.processInfo.environment["IRIS_INGEST_MESSAGES"] == "1",
-       let msgLedgers = irisLedgers {
-        let cursorFile = SecureStore.baseDir.appendingPathComponent("ledger/.messages-cursor")
-        let source = MessagesSource()
-        let scrub = PhiMaskScrubber()
-        let pollMessages = {
-            DispatchQueue.global(qos: .utility).async {
-                let cursor = try? String(contentsOf: cursorFile, encoding: .utf8)
-                guard let result = try? source.fetch(since: cursor, limit: 200) else { return }
-                for item in result.items { _ = try? Ingest.ingest(item, scrub: scrub, into: msgLedgers) }
-                if !result.items.isEmpty, let next = result.next {
-                    try? next.write(to: cursorFile, atomically: true, encoding: .utf8)
-                    NSLog("SonarDictate: ingested \(result.items.count) messages")
-                }
-            }
-        }
-        pollMessages()
-        let msgTimer = Timer(timeInterval: 300, repeats: true) { _ in pollMessages() }
-        RunLoop.main.add(msgTimer, forMode: .common)
+    // Connector pollers (OPT-IN, off by default). Each needs the user to turn it
+    // on; both route to the personal chain through the one SourcePoller.
+    let ledgerDirForSources = SecureStore.baseDir.appendingPathComponent("ledger", isDirectory: true)
+    // Messages (IRIS_INGEST_MESSAGES=1) - local iMessage/SMS; needs Full Disk Access.
+    if ProcessInfo.processInfo.environment["IRIS_INGEST_MESSAGES"] == "1", let lg = irisLedgers {
+        SourcePoller.start(MessagesSource(),
+            cursorFile: ledgerDirForSources.appendingPathComponent(".messages-cursor"),
+            into: lg, scrub: PhiMaskScrubber(), intervalSec: 300)
+    }
+    // Drop folder (IRIS_INBOX_DIR=<path>) - text files you drop in get ingested.
+    if let inbox = ProcessInfo.processInfo.environment["IRIS_INBOX_DIR"], !inbox.isEmpty,
+       let lg = irisLedgers {
+        let dir = URL(fileURLWithPath: (inbox as NSString).expandingTildeInPath)
+        SourcePoller.start(FolderSource(dir: dir),
+            cursorFile: ledgerDirForSources.appendingPathComponent(".folder-cursor"),
+            into: lg, scrub: PhiMaskScrubber(), intervalSec: 120)
     }
 
     let eyeOverlay = EyeOverlay()
