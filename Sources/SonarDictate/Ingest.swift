@@ -29,10 +29,29 @@ enum Ingest {
     // caller can drive memory / learning. The owner the classifier returns picks
     // the seal (Enclave for company, recoverable for personal) - fail-toward-
     // protection means a personal item with a sensitive marker lands in company.
+    // Deterministic ingest: scrub -> verdict (owner/kind) -> persist. No model.
     @discardableResult
     static func ingest(_ item: SourceItem, scrub: Scrubber, into ledgers: Ledgers) throws -> TaggedRecord {
         let clean = scrub.scrub(item.text)
         let v = Classifier.verdict(text: clean, source: item.source, provenance: item.provenance)
+        return try persist(clean: clean, verdict: v, item: item, into: ledgers)
+    }
+
+    // Enriched ingest (the live path): same deterministic owner/kind, plus
+    // best-effort model topic/about/tags filled in BEFORE persist (records are
+    // append-only - enrichment cannot happen after). Enrichment never affects
+    // owner/kind, so the wall stays deterministic.
+    @discardableResult
+    static func ingestEnriched(_ item: SourceItem, scrub: Scrubber, into ledgers: Ledgers) async throws -> TaggedRecord {
+        let clean = scrub.scrub(item.text)
+        var v = Classifier.verdict(text: clean, source: item.source, provenance: item.provenance)
+        let meta = await Classifier.enrich(clean)
+        v.topic = meta.topic; v.about = meta.about; v.tags = meta.tags
+        return try persist(clean: clean, verdict: v, item: item, into: ledgers)
+    }
+
+    private static func persist(clean: String, verdict v: Verdict, item: SourceItem,
+                                into ledgers: Ledgers) throws -> TaggedRecord {
         let record = TaggedRecord(
             at: item.at, owner: v.owner, source: item.source,
             kind: v.kind.label, topic: v.topic, tags: v.tags, text: clean

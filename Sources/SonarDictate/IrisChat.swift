@@ -363,7 +363,7 @@ final class IrisChat: NSObject {
         let scrubber = self.scrubber
         let deriver = self.deriver
         Task.detached {
-            guard let record = try? Ingest.ingest(
+            guard let record = try? await Ingest.ingestEnriched(
                 SourceItem(source: "chat", provenance: .personal, at: Date(), text: text, externalId: nil),
                 scrub: scrubber, into: ledgers) else { return }
             _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)

@@ -78,4 +78,40 @@ enum Classifier {
             salience: Salience.base(kind: k, age: 0)
         )
     }
+
+    // Model enrichment - OFF the safety path. The owner/kind verdict above is
+    // deterministic; this only fills topic/about/tags for recall. Best-effort.
+    static func enrich(_ text: String) async -> EnrichedMeta {
+        let prompt = """
+        Classify the text into JSON metadata for search. Give a one-word-or-short \
+        topic, the people/projects it is about, and 1-4 lowercase tags.
+        Output ONLY JSON: {"topic":"...","about":["..."],"tags":["..."]}.
+        Text: \(text)
+        """
+        guard let r = await IrisClient.complete(prompt) else { return .empty }
+        return parseMeta(r)
+    }
+
+    // Deterministic parse of the enrichment JSON (testable; bounds the fields).
+    static func parseMeta(_ raw: String) -> EnrichedMeta {
+        guard let s = raw.firstIndex(of: "{"), let e = raw.lastIndex(of: "}"), s < e,
+              let data = String(raw[s...e]).data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .empty
+        }
+        let topicRaw = (obj["topic"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let topic = (topicRaw?.isEmpty ?? true) ? nil : topicRaw
+        let about = ((obj["about"] as? [String]) ?? []).map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let tags = ((obj["tags"] as? [String]) ?? []).map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return EnrichedMeta(topic: topic, about: Array(about.prefix(6)), tags: Array(tags.prefix(6)))
+    }
+}
+
+struct EnrichedMeta {
+    let topic: String?
+    let about: [String]
+    let tags: [String]
+    static let empty = EnrichedMeta(topic: nil, about: [], tags: [])
 }
