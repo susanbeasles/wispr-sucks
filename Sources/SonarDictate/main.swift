@@ -1468,7 +1468,10 @@ if #available(macOS 26.0, *) {
     // separate from the sealed dictation path. Stage 1 streams the labeled
     // transcript into her chat with a LISTENING marker so you can verify she hears.
     let callListener = CallListener()
-    callListener.onSegment = { label, text in irisChat.appendCallSegment(label, text) }
+    callListener.onSegment = { label, text in
+        irisChat.appendCallSegment(label, text)
+        irisChat.ingestCallSegment(label, text)   // seal the call transcript (best-effort)
+    }
     callListener.onState = { on in irisChat.noteListening(on) }
     callListener.onDiag = { text in irisChat.noteDiag(text) }
     // Click-to-listen (the hotkey gets eaten by terminal Secure Keyboard Entry).

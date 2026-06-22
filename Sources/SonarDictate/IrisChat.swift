@@ -346,7 +346,8 @@ final class IrisChat: NSObject {
     // MARK: - Memory (her brain)
 
     private func remember(_ text: String, kind: String, tag: Bool) {
-        if kind != "reply" { ingestToLedger(text) }   // seal real input + learn (best-effort)
+        if kind != "reply" { ingestToLedger(text, source: "chat", provenance: .personal) }
+
         guard let memory, let embedder else { return }
         Task.detached {
             guard let v = try? embedder.vector(for: text) else { return }
@@ -358,16 +359,23 @@ final class IrisChat: NSObject {
     // Seal what you said into the owner-routed ledger (PHI-scrubbed, classified by
     // owner) and derive learnings into her brain. Fully detached, best-effort -
     // never blocks the reply, never breaks the chat if the ledger/masker is absent.
-    private func ingestToLedger(_ text: String) {
+    private func ingestToLedger(_ text: String, source: String, provenance: DataOwner) {
         guard let ledgers else { return }
         let scrubber = self.scrubber
         let deriver = self.deriver
         Task.detached {
             guard let record = try? await Ingest.ingestEnriched(
-                SourceItem(source: "chat", provenance: .personal, at: Date(), text: text, externalId: nil),
+                SourceItem(source: source, provenance: provenance, at: Date(), text: text, externalId: nil),
                 scrub: scrubber, into: ledgers) else { return }
             _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)
         }
+    }
+
+    // Her ears: a committed call segment, sealed best-effort. Calls default to
+    // COMPANY provenance (work-by-default on a PHI machine); the classifier can
+    // only escalate. Called from the CallListener wiring.
+    func ingestCallSegment(_ label: String, _ text: String) {
+        ingestToLedger(text, source: "call-\(label)", provenance: .company)
     }
 
     // MARK: - Transcript
