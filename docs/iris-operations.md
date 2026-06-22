@@ -44,7 +44,7 @@ the same line. New Mac + that 1Password item + the backup = full restore.
 | `IRIS_BACKUP_DIR` | Off-device backup destination - point at a synced folder (iCloud Drive / Dropbox local folder). Replicates the recoverable chains (ciphertext only; company chain never leaves) at launch + every 5 min. |
 | `IRIS_INGEST_MESSAGES=1` | Ingest local iMessage/SMS (`chat.db`) into the personal chain. Needs Full Disk Access granted to the app. Off by default. |
 | `IRIS_INBOX_DIR=<path>` | Drop-folder ingestion - text files (.txt/.md) dropped there get ingested into the personal chain. |
-| `IRIS_VOICE_ISOLATION=1` | Record dictation cleanly OVER music/noise (Apple voice-processing echo cancellation). On while it gets real-world validation; will become default once confirmed good. |
+| `IRIS_VOICE_ISOLATION=0` | Voice isolation (record cleanly OVER music/noise via Apple voice processing) is ON BY DEFAULT. Set to 0 only to turn it OFF if normal no-music dictation ever degrades. For stronger ML separation, also set Control Center -> Mic Mode -> Voice Isolation while Iris uses the mic. |
 | `IRIS_PHIMASK_DIR` | Path to the phi-mask package (default `~/code/phi-mask`). |
 | `IRIS_VOICE_DIR` | Path to the voice dir (default the repo `voice/`). |
 

@@ -128,7 +128,11 @@ final class Dictator {
         // input format is stable by the time startListening() reads it. Behind a
         // flag while it gets real-world validation - I/O audio cannot be unit-tested:
         //   IRIS_VOICE_ISOLATION=1
-        if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] == "1" {
+        // Voice isolation is ON by default now that it is validated (records cleanly
+        // over speaker music). Opt OUT with IRIS_VOICE_ISOLATION=0 if normal
+        // (no-music) dictation ever degrades. Enable failures degrade gracefully to
+        // plain capture (the do/catch below), so default-on is safe.
+        if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] != "0" {
             // Write the result to a PLAINTEXT diag file (NSLog goes to the encrypted
             // log, which is unreadable without the password-prompt flood). This lets
             // the exact error be read directly.
