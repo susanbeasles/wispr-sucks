@@ -1422,9 +1422,11 @@ if #available(macOS 26.0, *) {
     // derivation is the documented portable upgrade). Best-effort: if any of this
     // fails to init, the rest of Iris runs unaffected.
     let irisLedgers: Ledgers? = {
-        guard let kek = try? KeychainStore.loadOrCreateDBKey(),
-              let enclaveKey = try? EnclaveKey.loadOrCreate() else { return nil }
+        guard let enclaveKey = try? EnclaveKey.loadOrCreate() else { return nil }
         let dir = SecureStore.baseDir.appendingPathComponent("ledger", isDirectory: true)
+        // Recoverable seal: the passphrase-derived KEK if set up (op run +
+        // IRIS_LEDGER_PASSPHRASE), else the device key. See LedgerSecret.
+        let kek = LedgerSecret.recoverableKEK(dir: dir)
         let enclave = EnclaveWrap(box: EnclaveBox(
             key: enclaveKey, salt: "__sonar_dictate_ledger_company__", info: "sonar-dictate.v1.ledger"))
         return try? Ledgers(dir: dir, enclave: enclave, recoverable: RecoverableWrap(kek: kek))

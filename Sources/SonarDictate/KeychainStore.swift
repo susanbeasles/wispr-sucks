@@ -56,6 +56,27 @@ enum KeychainStore {
         return SymmetricKey(data: bytes)
     }
 
+    // Load a stored 32-byte key for an arbitrary account (nil if none). Used to
+    // CACHE the ledger's recoverable KEK so it is derived from the passphrase once
+    // (one op run), then read prompt-free thereafter. Separate account from the
+    // corpus key above - this does not touch it.
+    static func loadKey(account otherAccount: String) throws -> SymmetricKey? {
+        guard let data = try readKey(account: otherAccount) else { return nil }
+        return SymmetricKey(data: data)
+    }
+
+    // Upsert a 32-byte key under an arbitrary account.
+    static func storeKey(_ key: SymmetricKey, account otherAccount: String) throws {
+        let data = key.withUnsafeBytes { Data($0) }
+        guard data.count == keyByteCount else { throw KeychainStoreError.unexpectedKeySize(data.count) }
+        SecItemDelete([
+            kSecClass as String:       kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: otherAccount,
+        ] as CFDictionary)
+        try writeKey(data, account: otherAccount)
+    }
+
     // Destroy the keychain item. Called by `sonar-dictate reset` so the DB
     // becomes cryptographically unrecoverable.
     static func deleteKey() throws {
@@ -73,7 +94,7 @@ enum KeychainStore {
 
     // MARK: - Internals
 
-    private static func readKey() throws -> Data? {
+    private static func readKey(account: String = account) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String:        kSecClassGenericPassword,
             kSecAttrService as String:  service,
@@ -99,7 +120,7 @@ enum KeychainStore {
         }
     }
 
-    private static func writeKey(_ key: Data) throws {
+    private static func writeKey(_ key: Data, account: String = account) throws {
         let attrs: [String: Any] = [
             kSecClass as String:        kSecClassGenericPassword,
             kSecAttrService as String:  service,
