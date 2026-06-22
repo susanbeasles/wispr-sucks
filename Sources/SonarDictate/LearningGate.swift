@@ -21,10 +21,11 @@ struct Learning: Codable {
     let sourceOwner: DataOwner // provenance (where it was learned), NOT the data
 }
 
-// What proposes learnings (an LLM / Apple model later; injected so it is fakeable
-// in tests). The deriver only PROPOSES; the gate decides what crosses.
+// What proposes learnings (an on-device LLM; injected so it is fakeable in tests).
+// The deriver only PROPOSES; the gate decides what crosses. Async because the
+// real deriver calls the local model.
 protocol LearningDeriver {
-    func learnings(from record: TaggedRecord) -> [Learning]
+    func learnings(from record: TaggedRecord) async -> [Learning]
 }
 
 enum LearningGate {

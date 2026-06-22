@@ -30,7 +30,7 @@ enum Ingest {
     // the seal (Enclave for company, recoverable for personal) - fail-toward-
     // protection means a personal item with a sensitive marker lands in company.
     @discardableResult
-    static func ingest(_ item: SourceItem, scrub: Scrubber, into ledgers: Ledgers) throws -> Verdict {
+    static func ingest(_ item: SourceItem, scrub: Scrubber, into ledgers: Ledgers) throws -> TaggedRecord {
         let clean = scrub.scrub(item.text)
         let v = Classifier.verdict(text: clean, source: item.source, provenance: item.provenance)
         let record = TaggedRecord(
@@ -38,6 +38,25 @@ enum Ingest {
             kind: v.kind.label, topic: v.topic, tags: v.tags, text: clean
         )
         try ledgers.append(record)
-        return v
+        return record
+    }
+
+    // Derive learnings from a stored record and admit them into the ONE brain
+    // chain - the loop that fills her brain. The deriver proposes; the gate keeps
+    // only abstractions (raw - company OR personal - can never cross). Learnings
+    // are Susan's regardless of which owner they were learned from, so they land in
+    // the recoverable `brain` chain. Returns how many crossed.
+    @discardableResult
+    static func learn(from record: TaggedRecord, using deriver: LearningDeriver,
+                      into ledgers: Ledgers) async throws -> Int {
+        let proposed = await deriver.learnings(from: record)
+        let admitted = LearningGate.admit(proposed, from: record)
+        for l in admitted {
+            try ledgers.append(TaggedRecord(
+                at: Date(), owner: .brain, source: "learning:\(record.source)",
+                kind: "fact", topic: nil, tags: l.about, text: l.text
+            ))
+        }
+        return admitted.count
     }
 }

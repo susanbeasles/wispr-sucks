@@ -78,9 +78,17 @@ Ingest - the one pipeline (reused by all sources):
 - Verified: owner asymmetry (company never downgraded even on "private diary";
   personal+PHI/confidential escalates), kind heuristic, end-to-end NO-BLEED -
   a sensitive personal item lands in company and is absent from personal.
+2026-06-21: learning loop - DONE, builds clean, 8/8 tests pass.
+- LearningDeriver made async; ModelLearningDeriver.swift asks the local model to
+  abstract a record into learnings (best-effort, [] on failure - never leaks raw).
+- Ingest.learn = derive -> LearningGate.admit -> append admitted to the ONE brain
+  chain (owner=.brain, recoverable). Learnings from BOTH personal and company raw
+  are Susan's and land in the brain; raw stays in its owner-sealed chain.
+- Verified: only abstractions admitted; company raw stays company-sealed; NO raw
+  company text ("confidential...") reaches the brain; the abstraction does.
 - NEXT: model enrichment (topic/about/tags via IrisClient/Apple, off the safety
-  path); the Source adapter (fetch/cursor) for real connectors; learning
-  derivation (deriver -> existing LearningGate -> brain chain).
+  path); the Source adapter (fetch/cursor) for real connectors; wire ingest+learn
+  into the live app (senses/chat -> ingest).
 
 ## Notes
 
