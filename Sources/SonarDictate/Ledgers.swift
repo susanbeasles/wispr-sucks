@@ -54,6 +54,13 @@ final class Ledgers {
 
     func height(_ owner: DataOwner) -> UInt64 { chain(owner).height }
 
+    func head(_ owner: DataOwner) -> ChainHead { chain(owner).head }
+
+    // Verify a chain ends at exactly an anchored head (truncation/fork detection).
+    func verify(_ owner: DataOwner, expecting anchor: ChainHead) throws {
+        try chain(owner).verify(expecting: anchor)
+    }
+
     // Decode the chain back to its tagged records (the restore/read path).
     func records(_ owner: DataOwner) throws -> [TaggedRecord] {
         try chain(owner).entries().map { try Self.decoder.decode(TaggedRecord.self, from: $0.payload) }
