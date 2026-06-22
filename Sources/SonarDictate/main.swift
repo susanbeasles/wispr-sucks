@@ -129,16 +129,18 @@ final class Dictator {
         // flag while it gets real-world validation - I/O audio cannot be unit-tested:
         //   IRIS_VOICE_ISOLATION=1
         if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] == "1" {
+            // VPIO is a DUPLEX unit - build the render (output) graph BEFORE enabling
+            // it, or the enable throws / capture stays broken. Touch output + mixer
+            // first, drive a silent render, THEN turn on voice processing.
+            engine.mainMixerNode.outputVolume = 0
+            _ = engine.outputNode
+            _ = engine.mainMixerNode
+            engine.prepare()
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
-                // Drive a silent render so the echo-canceller has its reference (the
-                // missing piece before). mainMixer -> output is the default graph;
-                // muting it means nothing is played, but the render chain still runs.
-                engine.mainMixerNode.outputVolume = 0
-                _ = engine.outputNode
                 NSLog("SonarDictate: voice isolation ON (dictate over music); input format now \(engine.inputNode.outputFormat(forBus: 0))")
             } catch {
-                NSLog("SonarDictate: voice isolation enable failed: \(error.localizedDescription)")
+                NSLog("SonarDictate: voice isolation enable FAILED: \(error) :: \(error.localizedDescription)")
             }
         }
 
