@@ -46,6 +46,10 @@ final class PerceptionMemory {
 
     var count: Int { queue.sync { entries.count } }
 
+    // A snapshot of every stored entry (oldest first) - used by the one-time
+    // ledger backfill to seal her existing history.
+    func all() -> [PerceptionEntry] { queue.sync { entries } }
+
     // Append a memory and persist. Used by the silent eye loop (observations) and
     // the conversation (utterances + replies).
     func add(at: Date, vector: [Double], summary: String, kind: String, tags: [String] = []) throws {

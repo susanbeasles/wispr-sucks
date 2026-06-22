@@ -1432,6 +1432,18 @@ if #available(macOS 26.0, *) {
         return try? Ledgers(dir: dir, enclave: enclave, recoverable: RecoverableWrap(kek: kek))
     }()
 
+    // One-time: seal her existing perception history into the ledger so the past
+    // gets the same protection as new intake. Marker-guarded, sequential, detached.
+    if let backfillLedgers = irisLedgers, let mem = irisMemory {
+        let ledgerDir = SecureStore.baseDir.appendingPathComponent("ledger", isDirectory: true)
+        let items = mem.all().map { LedgerBackfill.Item(at: $0.at, summary: $0.summary, kind: $0.kind) }
+        DispatchQueue.global(qos: .utility).async {
+            let n = LedgerBackfill.runOnce(items, into: backfillLedgers,
+                                           scrub: PhiMaskScrubber(), dir: ledgerDir)
+            if n > 0 { NSLog("SonarDictate: backfilled \(n) history entries into the ledger") }
+        }
+    }
+
     // Off-device backup (opt-in). If IRIS_BACKUP_DIR is set (e.g. an iCloud Drive
     // or Dropbox local folder), replicate the RECOVERABLE chains there at launch
     // and every 5 minutes. Zero-knowledge (ciphertext only); the company chain is
