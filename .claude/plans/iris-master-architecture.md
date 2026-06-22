@@ -116,15 +116,23 @@ ROADMAP (dependency order; [x] done, [>] next, [ ] later)
 [x] Voice: chosen, wired
 [x] Brain rank core: Salience + day-brief
 [x] Spine slice 1: SealedLedger + LedgerKey (hash chain, recoverable, tested)
-[>] Spine slice 2: pluggable KeyWrap (Enclave vs recoverable) + owner routing
-[ ] Learning gate: abstraction-only crossing into the brain chain
-[ ] Classify v2: Signal/Verdict + owner/jurisdiction at the ingest chokepoint
-[ ] Ingest spine: Source primitive + one pipeline (scrub->classify->persist), faked
-[ ] Migrate artifacts into the ledger (logs/memory/corpus/sessions), tagged+routed
-[ ] Backup adapters: R2 then Dropbox (recoverable chains only), creds via op
-[ ] Connectors: in-scope sources only, one at a time, creds via Agora
+[x] Spine slice 2: pluggable KeyWrap (Enclave vs recoverable) + owner routing
+[x] Learning gate: abstraction-only crossing into the brain chain
+[x] Classifier: Verdict + owner rule (provenance-first, fail-toward-protection)
+[x] Ingest spine: SourceItem + one pipeline (scrub->classify->persist) + learn
+[x] Learning loop: derive -> gate -> brain chain (ModelLearningDeriver)
+[x] PHI gate: PhiMaskScrubber bridged to phi-mask, fail-closed
+[x] Truncation defense: verify(expecting: head) + ChainHead
+[x] Recovery passphrase: 1Password (op://Personal/iris-ledger-credential) + LedgerSecret, validated
+[x] Model enrichment: topic/about/tags off the safety path
+[x] Backup: Replicator + FolderSink (synced folder, ciphertext, company excluded) + opt-in scheduler
+[x] Live wiring: chat + eyes + ears -> ingest; /brain command
+[ ] RUNTIME SMOKE TEST (owner): rebuild + relaunch (ideally op-run setup), /brain
+[ ] Migrate existing artifacts (logs/corpus/sessions) into the ledger
 [ ] Consolidation ("sleep"): idle distill raw -> better long-term
+[ ] Connectors: in-scope sources only, one at a time, creds via Agora (blocked: MCP)
 [ ] Isolation: locked socket / eventual VM for her integrity
+[ ] KDF hardening: Argon2id over PBKDF2
 
 OPEN QUESTIONS for the owner:
 - In-scope source set (Slack? Otter? personal-only?) and each one's owner tag.
