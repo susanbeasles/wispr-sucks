@@ -198,6 +198,10 @@ final class IrisChat: NSObject {
             showBrief()
             return
         }
+        if lower == "/brain" || lower == "/ledger" {
+            showBrain()
+            return
+        }
         if lower == "/agenda" || lower == "/list" || lower.contains("what's on my list")
             || lower.contains("whats on my list") || lower.contains("my agenda")
             || lower.contains("my action items") || lower.contains("my to-do") || lower.contains("my todo") {
@@ -281,6 +285,24 @@ final class IrisChat: NSObject {
     // (something to do); a note is a fact (something to remember).
     private static func salienceKind(_ agendaKind: String) -> Salience.Kind {
         agendaKind == "note" ? .fact : .action
+    }
+
+    // Make the live ledger observable in the window (per the diagnose-in-UI rule,
+    // never the CLI): chain heights + her most recent learnings. Best-effort.
+    private func showBrain() {
+        guard let ledgers else {
+            appendAttr("(ledger not available this session)\n", color: .secondaryLabelColor, bold: false)
+            return
+        }
+        let p = ledgers.height(.personal), c = ledgers.height(.company), b = ledgers.height(.brain)
+        appendAttr("Sealed ledger - personal \(p), company \(c), brain \(b) learning(s)\n",
+                   color: NSColor.systemIndigo, bold: true)
+        if let brain = try? ledgers.records(.brain), !brain.isEmpty {
+            appendAttr("Recently learned:\n", color: .secondaryLabelColor, bold: false)
+            for r in brain.suffix(6) {
+                appendAttr("  * \(r.text)\n", color: .labelColor, bold: false)
+            }
+        }
     }
 
     // Auto-capture action items / notes from a message (background, conservative).
