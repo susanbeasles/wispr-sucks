@@ -302,6 +302,11 @@ final class IrisChat: NSObject {
         appendAttr("Sealed ledger - personal \(p), company \(c), brain \(b) learning(s)\n",
                    color: NSColor.systemIndigo, bold: true)
         if let brain = try? ledgers.records(.brain), !brain.isEmpty {
+            let themes = BrainThemes.top(brain)
+            if !themes.isEmpty {
+                let line = themes.map { "\($0.theme) (\($0.count))" }.joined(separator: ", ")
+                appendAttr("Themes: \(line)\n", color: .secondaryLabelColor, bold: false)
+            }
             appendAttr("Recently learned:\n", color: .secondaryLabelColor, bold: false)
             for r in brain.suffix(6) {
                 appendAttr("  * \(r.text)\n", color: .labelColor, bold: false)
