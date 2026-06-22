@@ -1463,6 +1463,32 @@ if #available(macOS 26.0, *) {
         RunLoop.main.add(backupTimer, forMode: .common)
     }
 
+    // Messages ingestion (OPT-IN). If IRIS_INGEST_MESSAGES=1 and Full Disk Access
+    // is granted, poll new iMessages/SMS into the PERSONAL chain at launch + every
+    // 5 min, incrementally by ROWID cursor. Off by default - she does not read your
+    // messages unless you turn this on. Uses the sync deterministic Ingest (no
+    // model hammering on a bulk source); the scrubber still gates PHI.
+    if ProcessInfo.processInfo.environment["IRIS_INGEST_MESSAGES"] == "1",
+       let msgLedgers = irisLedgers {
+        let cursorFile = SecureStore.baseDir.appendingPathComponent("ledger/.messages-cursor")
+        let source = MessagesSource()
+        let scrub = PhiMaskScrubber()
+        let pollMessages = {
+            DispatchQueue.global(qos: .utility).async {
+                let cursor = try? String(contentsOf: cursorFile, encoding: .utf8)
+                guard let result = try? source.fetch(since: cursor, limit: 200) else { return }
+                for item in result.items { _ = try? Ingest.ingest(item, scrub: scrub, into: msgLedgers) }
+                if !result.items.isEmpty, let next = result.next {
+                    try? next.write(to: cursorFile, atomically: true, encoding: .utf8)
+                    NSLog("SonarDictate: ingested \(result.items.count) messages")
+                }
+            }
+        }
+        pollMessages()
+        let msgTimer = Timer(timeInterval: 300, repeats: true) { _ in pollMessages() }
+        RunLoop.main.add(msgTimer, forMode: .common)
+    }
+
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)

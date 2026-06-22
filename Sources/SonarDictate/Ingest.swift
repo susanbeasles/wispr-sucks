@@ -6,11 +6,22 @@ import Foundation
 // sealed chain. No per-source workflow.
 
 struct SourceItem {
-    let source: String          // provenance label: "dictation" | "eye" | "slack" | ...
+    let source: String          // provenance label: "dictation" | "eye" | "messages" | ...
     let provenance: DataOwner   // origin owner (the source knows: SonarMD-Slack = company)
     let at: Date
     let text: String
-    let externalId: String?     // for dedup / cursors later
+    let externalId: String?     // for dedup / cursors
+}
+
+// A connector: its only job is to normalize a service's items into SourceItems.
+// The ingest pipeline does everything after (scrub -> classify -> seal). fetch is
+// incremental - it takes the last cursor and returns new items + the next cursor,
+// so each pull only sees what is new. One protocol, every source - no per-service
+// workflow.
+protocol Source {
+    var id: String { get }
+    var defaultOwner: DataOwner { get }
+    func fetch(since cursor: String?, limit: Int) throws -> (items: [SourceItem], next: String?)
 }
 
 // Removes PHI before anything persists - the mandatory gate. Identity is a TEST
