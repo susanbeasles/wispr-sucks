@@ -7,7 +7,17 @@ is still `sonar-dictate`.) Architecture lives in `.claude/plans/iris-*.md`.
 
 ```
 ./scripts/build-app.sh debug
-pkill -f dist/SonarDictate.app; open dist/SonarDictate.app
+pkill -f dist/SonarDictate.app; open dist/SonarDictate.app          # normal launch, no env
+```
+
+IMPORTANT: env switches below only reach the app when it is launched DIRECTLY
+(the binary), not via `open` - `open` hands off to launchd, which drops your
+shell env. Direct launch (runs attached to the terminal):
+
+```
+BIN=dist/SonarDictate.app/Contents/MacOS/SonarDictate
+pkill -f dist/SonarDictate.app
+IRIS_VOICE_ISOLATION=1 "$BIN" &        # example: one switch, backgrounded
 ```
 
 ## One-time setup: portable recovery (recommended, do it early)
@@ -15,11 +25,12 @@ pkill -f dist/SonarDictate.app; open dist/SonarDictate.app
 The personal + brain ledger chains are sealed with a recoverable key. Derive that
 key from the 1Password passphrase ONCE (it gets cached; later launches need no
 `op`). Do this BEFORE much data accumulates, so the chains seal with the
-recoverable key from the start:
+recoverable key from the start. Note the DIRECT binary launch (not `open`):
 
 ```
+pkill -f dist/SonarDictate.app
 IRIS_LEDGER_PASSPHRASE='op://Personal/iris-ledger-credential/password' \
-  op run --account my.1password.com -- open dist/SonarDictate.app
+  op run --account my.1password.com -- dist/SonarDictate.app/Contents/MacOS/SonarDictate &
 ```
 
 Recovery on a new Mac: restore the backup folder (carries the KDF salt) and re-run
@@ -37,14 +48,16 @@ the same line. New Mac + that 1Password item + the backup = full restore.
 | `IRIS_PHIMASK_DIR` | Path to the phi-mask package (default `~/code/phi-mask`). |
 | `IRIS_VOICE_DIR` | Path to the voice dir (default the repo `voice/`). |
 
-Example - everything on, with recovery:
+Example - everything on, with recovery (DIRECT binary launch, not `open`):
 
 ```
+pkill -f dist/SonarDictate.app
 IRIS_LEDGER_PASSPHRASE='op://Personal/iris-ledger-credential/password' \
 IRIS_BACKUP_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/iris-backup" \
 IRIS_INGEST_MESSAGES=1 \
 IRIS_INBOX_DIR="$HOME/iris-inbox" \
-  op run --account my.1password.com -- open dist/SonarDictate.app
+IRIS_VOICE_ISOLATION=1 \
+  op run --account my.1password.com -- dist/SonarDictate.app/Contents/MacOS/SonarDictate &
 ```
 
 ## Chat commands (type in her window)
