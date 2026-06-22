@@ -128,9 +128,13 @@ ROADMAP (dependency order; [x] done, [>] next, [ ] later)
 [x] Backup: Replicator + FolderSink (synced folder, ciphertext, company excluded) + opt-in scheduler
 [x] Live wiring: chat + eyes + ears -> ingest; /brain command
 [ ] RUNTIME SMOKE TEST (owner): rebuild + relaunch (ideally op-run setup), /brain
-[ ] Migrate existing artifacts (logs/corpus/sessions) into the ledger
+[x] History backfill: existing perception memory sealed into the ledger
+[x] Connectors (local, no creds): Source protocol + SourcePoller + MessagesSource
+    (chat.db, opt-in, Full Disk Access) + FolderSource (drop folder). Themes view,
+    /verify, learning dedup, ops doc (docs/iris-operations.md).
+[ ] Migrate the corpus DB + session logs into the ledger
 [ ] Consolidation ("sleep"): idle distill raw -> better long-term
-[ ] Connectors: in-scope sources only, one at a time, creds via Agora (blocked: MCP)
+[ ] Agora-creds connectors (Slack/etc.) - blocked: MCP disconnected
 [ ] Isolation: locked socket / eventual VM for her integrity
 [ ] KDF hardening: Argon2id over PBKDF2
 
