@@ -32,6 +32,14 @@ final class Eye {
     // text-ratio gate and simply does not record memory.
     private var embedder: TextEmbedder?
     private var memory: PerceptionMemory?
+    // The sealed ledger (optional, best-effort). Screen observations default to
+    // COMPANY provenance: on a PHI machine the screen is work-by-default, so the
+    // safe (fail-toward-protection) seal is the device-bound Enclave chain. The
+    // classifier can only escalate further, never relax it. Screen OCR can carry
+    // PHI, so it goes through the same mandatory scrubber.
+    private var ledgers: Ledgers?
+    private let scrubber: Scrubber = PhiMaskScrubber()
+    private let deriver: LearningDeriver = ModelLearningDeriver()
     // A rolling window of recent per-tick embeddings; its centroid is "what I have
     // been looking at," and a new frame far from it is the meaningful change.
     private var recentVectors: [[Double]] = []
@@ -60,6 +68,8 @@ final class Eye {
         self.embedder = embedder
         self.memory = memory
     }
+
+    func attachLedger(_ ledgers: Ledgers?) { self.ledgers = ledgers }
 
     func toggle() { isWatching ? stop() : start() }
 
@@ -136,6 +146,17 @@ final class Eye {
                 let content = note.isEmpty ? String(t.prefix(600)) : note
                 try? self.memory?.add(at: Date(), vector: v, summary: content, kind: "observation")
                 EyeSignals.shared.noteRemembered(self.memory?.count ?? 0)
+                // Also seal the observation into the owner-routed ledger (company
+                // by default for screen) + derive learnings - best-effort, detached.
+                if let ledgers = self.ledgers {
+                    let scrubber = self.scrubber, deriver = self.deriver
+                    Task.detached {
+                        guard let record = try? await Ingest.ingestEnriched(
+                            SourceItem(source: "eye", provenance: .company, at: Date(), text: content, externalId: nil),
+                            scrub: scrubber, into: ledgers) else { return }
+                        _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)
+                    }
+                }
             } catch {
                 EyeSignals.shared.publishStatus("screen capture blocked - grant Screen Recording in System Settings")
             }

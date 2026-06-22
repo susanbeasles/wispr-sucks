@@ -1436,6 +1436,7 @@ if #available(macOS 26.0, *) {
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)
     eye.attachMemory(embedder: irisEmbedder, memory: irisMemory)
+    eye.attachLedger(irisLedgers)
     eyeOverlay.install()
 
     // Iris's conversation surface - the ONLY place she speaks, and only when
