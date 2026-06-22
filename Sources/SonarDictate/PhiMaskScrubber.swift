@@ -48,6 +48,43 @@ struct PhiMaskScrubber: Scrubber {
         }
     }
 
+    // Mask many texts in ONE python invocation (JSON array in, JSON array out) -
+    // for bulk sources, so a first sync does not spawn a process per message.
+    // FAIL-CLOSED: any failure or a count mismatch returns all-redacted.
+    func scrubBatch(_ texts: [String]) -> [String] {
+        guard !texts.isEmpty else { return [] }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["python3", "-c",
+            "import sys, json; from phimask import mask; "
+            + "sys.stdout.write(json.dumps([mask(t).text for t in json.load(sys.stdin)]))"]
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONPATH"] = dir
+        p.environment = env
+
+        let inPipe = Pipe(), outPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = outPipe
+        p.standardError = FileHandle.nullDevice
+        let allRedacted = texts.map { _ in Self.redacted }
+        do {
+            try p.run()
+            let input = try JSONSerialization.data(withJSONObject: texts)
+            inPipe.fileHandleForWriting.write(input)
+            inPipe.fileHandleForWriting.closeFile()
+            let out = outPipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0,
+                  let arr = try? JSONSerialization.jsonObject(with: out) as? [String],
+                  arr.count == texts.count else {
+                return allRedacted
+            }
+            return arr
+        } catch {
+            return allRedacted
+        }
+    }
+
     // Emitted when masking fails - never the original input.
     static let redacted = "[REDACTED]"
 }

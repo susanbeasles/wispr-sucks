@@ -13,7 +13,16 @@ enum SourcePoller {
             DispatchQueue.global(qos: .utility).async {
                 let cursor = try? String(contentsOf: cursorFile, encoding: .utf8)
                 guard let result = try? source.fetch(since: cursor, limit: limit) else { return }
-                for item in result.items { _ = try? Ingest.ingest(item, scrub: scrub, into: ledgers) }
+                // Scrub the whole batch in ONE pass (the gate runs here), then seal
+                // the pre-scrubbed items (IdentityScrubber = already clean, not a
+                // bypass). One python process for the batch, not one per item.
+                let cleaned = scrub.scrubBatch(result.items.map { $0.text })
+                let identity = IdentityScrubber()
+                for (item, clean) in zip(result.items, cleaned) {
+                    let scrubbed = SourceItem(source: item.source, provenance: item.provenance,
+                                              at: item.at, text: clean, externalId: item.externalId)
+                    _ = try? Ingest.ingest(scrubbed, scrub: identity, into: ledgers)
+                }
                 if !result.items.isEmpty, let next = result.next {
                     try? next.write(to: cursorFile, atomically: true, encoding: .utf8)
                     NSLog("SonarDictate: \(source.id) ingested \(result.items.count) item(s)")

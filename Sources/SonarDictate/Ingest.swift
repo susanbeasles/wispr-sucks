@@ -29,9 +29,16 @@ protocol Source {
 // argument (never defaulted), so the gate can never be silently skipped.
 protocol Scrubber {
     func scrub(_ text: String) -> String
+    // Scrub many texts at once. Default maps scrub; a real masker overrides this to
+    // do it in ONE pass (a bulk source must not spawn one process per item).
+    func scrubBatch(_ texts: [String]) -> [String]
 }
 
-struct IdentityScrubber: Scrubber {   // tests only - NOT a prod default
+extension Scrubber {
+    func scrubBatch(_ texts: [String]) -> [String] { texts.map(scrub) }
+}
+
+struct IdentityScrubber: Scrubber {   // tests / already-scrubbed input - NOT a prod gate
     func scrub(_ text: String) -> String { text }
 }
 

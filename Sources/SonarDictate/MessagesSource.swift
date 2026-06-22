@@ -30,10 +30,12 @@ struct MessagesSource: Source {
         defer { sqlite3_close(db) }
 
         let afterRowId = Int64(cursor ?? "") ?? 0
+        // No text/attributedBody filter in SQL - modern messages keep the body only
+        // in attributedBody; we derive the body in code and skip rows with neither.
         let sql = """
-        SELECT m.ROWID, m.text, m.date, m.is_from_me, h.id
+        SELECT m.ROWID, m.text, m.date, m.is_from_me, h.id, m.attributedBody
         FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-        WHERE m.ROWID > ? AND m.text IS NOT NULL AND m.text != ''
+        WHERE m.ROWID > ?
         ORDER BY m.ROWID ASC LIMIT ?
         """
         var stmt: OpaquePointer?
@@ -46,20 +48,58 @@ struct MessagesSource: Source {
 
         var items: [SourceItem] = []
         var lastRowId = afterRowId
+        var scanned = false
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let rowId = sqlite3_column_int64(stmt, 0)
-            lastRowId = rowId
-            guard let cText = sqlite3_column_text(stmt, 1) else { continue }
-            let body = String(cString: cText)
+            scanned = true
+            lastRowId = sqlite3_column_int64(stmt, 0)   // advance past scanned rows even if skipped
+            // Body: the plain text column, else decode attributedBody.
+            var body = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            if body.isEmpty, let blob = sqlite3_column_blob(stmt, 5) {
+                let n = Int(sqlite3_column_bytes(stmt, 5))
+                body = Self.decodeAttributedBody(Data(bytes: blob, count: n)) ?? ""
+            }
+            guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             let at = Self.appleDate(sqlite3_column_int64(stmt, 2))
             let fromMe = sqlite3_column_int(stmt, 3) == 1
             let who = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "unknown"
-            // Light direction prefix so "who said it" survives into her memory.
             let text = fromMe ? "(me) \(body)" : "(\(who)) \(body)"
             items.append(SourceItem(source: id, provenance: defaultOwner, at: at,
-                                    text: text, externalId: "msg-\(rowId)"))
+                                    text: text, externalId: "msg-\(lastRowId)"))
         }
-        return (items, items.isEmpty ? cursor : String(lastRowId))
+        return (items, scanned ? String(lastRowId) : cursor)
+    }
+
+    // Extract the message text from an attributedBody blob - an NSAttributedString
+    // archived in the old `typedstream` format (NSArchiver), which NSKeyedUnarchiver
+    // cannot read. The documented heuristic the iMessage tooling uses: find the
+    // "NSString" class marker, skip its 5 class/version bytes, then read a
+    // length-prefixed UTF-8 string (a 0x81 prefix means a 2-byte little-endian
+    // length, otherwise a single length byte). Returns nil if it does not match -
+    // the caller then skips the row rather than emitting garbage.
+    static func decodeAttributedBody(_ data: Data) -> String? {
+        let b = [UInt8](data)
+        guard let r = firstRange(of: Array("NSString".utf8), in: b) else { return nil }
+        var i = r + 5                                  // past "NSString" + 5 class bytes
+        guard i < b.count else { return nil }
+        let length: Int
+        if b[i] == 0x81 {
+            guard i + 2 < b.count else { return nil }
+            length = Int(b[i + 1]) | (Int(b[i + 2]) << 8)
+            i += 3
+        } else {
+            length = Int(b[i]); i += 1
+        }
+        guard length > 0, i + length <= b.count else { return nil }
+        return String(bytes: b[i..<i + length], encoding: .utf8)
+    }
+
+    // Index just PAST the first occurrence of `pattern` in `b`, or nil.
+    private static func firstRange(of pattern: [UInt8], in b: [UInt8]) -> Int? {
+        guard !pattern.isEmpty, b.count >= pattern.count else { return nil }
+        for start in 0...(b.count - pattern.count) where Array(b[start..<start + pattern.count]) == pattern {
+            return start + pattern.count
+        }
+        return nil
     }
 
     // chat.db `date` is nanoseconds since the 2001-01-01 reference date (modern
