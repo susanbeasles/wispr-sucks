@@ -70,12 +70,17 @@ enum Ingest {
                       into ledgers: Ledgers) async throws -> Int {
         let proposed = await deriver.learnings(from: record)
         let admitted = LearningGate.admit(proposed, from: record)
-        for l in admitted {
+        // Dedup against a recent window of the brain so recurring topics do not
+        // accumulate repeats. (Bounded read; the brain grows slowly - only gate-
+        // admitted, deduped abstractions land here.)
+        let recent = ((try? ledgers.records(.brain)) ?? []).suffix(100).map { $0.text }
+        let fresh = LearningGate.dedup(admitted, againstExisting: Array(recent))
+        for l in fresh {
             try ledgers.append(TaggedRecord(
                 at: Date(), owner: .brain, source: "learning:\(record.source)",
                 kind: "fact", topic: nil, tags: l.about, text: l.text
             ))
         }
-        return admitted.count
+        return fresh.count
     }
 }

@@ -64,6 +64,21 @@ enum LearningGate {
         return true
     }
 
+    // Drop learnings that duplicate one already known (normalized equality), so a
+    // recurring topic does not fill the brain with repeats. Also dedups within the
+    // batch. existingTexts is a recent window of the brain's learnings.
+    static func dedup(_ learnings: [Learning], againstExisting existingTexts: [String]) -> [Learning] {
+        var seen = Set(existingTexts.map(normalize))
+        var out: [Learning] = []
+        for l in learnings {
+            let key = normalize(l.text)
+            if key.isEmpty || seen.contains(key) { continue }
+            seen.insert(key)
+            out.append(l)
+        }
+        return out
+    }
+
     // MARK: - Helpers
 
     private static func normalize(_ s: String) -> String {

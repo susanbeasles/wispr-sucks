@@ -202,6 +202,10 @@ final class IrisChat: NSObject {
             showBrain()
             return
         }
+        if lower == "/verify" {
+            showVerify()
+            return
+        }
         if lower == "/agenda" || lower == "/list" || lower.contains("what's on my list")
             || lower.contains("whats on my list") || lower.contains("my agenda")
             || lower.contains("my action items") || lower.contains("my to-do") || lower.contains("my todo") {
@@ -301,6 +305,24 @@ final class IrisChat: NSObject {
             appendAttr("Recently learned:\n", color: .secondaryLabelColor, bold: false)
             for r in brain.suffix(6) {
                 appendAttr("  * \(r.text)\n", color: .labelColor, bold: false)
+            }
+        }
+    }
+
+    // Walk every chain and report tamper-evidence status in-window.
+    private func showVerify() {
+        guard let ledgers else {
+            appendAttr("(ledger not available this session)\n", color: .secondaryLabelColor, bold: false)
+            return
+        }
+        appendAttr("Ledger integrity:\n", color: NSColor.systemIndigo, bold: true)
+        for owner in DataOwner.allCases {
+            do {
+                try ledgers.verify(owner)
+                appendAttr("  \(owner.rawValue): OK (\(ledgers.height(owner)) records)\n",
+                           color: .systemGreen, bold: false)
+            } catch {
+                appendAttr("  \(owner.rawValue): BROKEN - \(error)\n", color: .systemRed, bold: false)
             }
         }
     }
