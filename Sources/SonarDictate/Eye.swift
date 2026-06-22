@@ -150,11 +150,13 @@ final class Eye {
                 // by default for screen) + derive learnings - best-effort, detached.
                 if let ledgers = self.ledgers {
                     let scrubber = self.scrubber, deriver = self.deriver
+                    let mem = self.memory, emb = self.embedder
                     Task.detached {
                         guard let record = try? await Ingest.ingestEnriched(
                             SourceItem(source: "eye", provenance: .company, at: Date(), text: content, externalId: nil),
                             scrub: scrubber, into: ledgers) else { return }
-                        _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)
+                        _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers,
+                                                    recallInto: mem, embedder: emb)
                     }
                 }
             } catch {

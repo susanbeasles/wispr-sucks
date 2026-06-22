@@ -84,8 +84,8 @@ enum Ingest {
     // are Susan's regardless of which owner they were learned from, so they land in
     // the recoverable `brain` chain. Returns how many crossed.
     @discardableResult
-    static func learn(from record: TaggedRecord, using deriver: LearningDeriver,
-                      into ledgers: Ledgers) async throws -> Int {
+    static func learn(from record: TaggedRecord, using deriver: LearningDeriver, into ledgers: Ledgers,
+                      recallInto memory: PerceptionMemory? = nil, embedder: TextEmbedder? = nil) async throws -> Int {
         let proposed = await deriver.learnings(from: record)
         let admitted = LearningGate.admit(proposed, from: record)
         // Dedup against a recent window of the brain so recurring topics do not
@@ -98,6 +98,12 @@ enum Ingest {
                 at: Date(), owner: .brain, source: "learning:\(record.source)",
                 kind: "fact", topic: nil, tags: l.about, text: l.text
             ))
+            // Close the loop: make the learning RECALLABLE in conversation, not just
+            // sealed. Embedding it into perception memory lets contextualize() surface
+            // it - she actually uses what she learns.
+            if let memory, let embedder, let v = try? embedder.vector(for: l.text) {
+                try? memory.add(at: Date(), vector: v, summary: l.text, kind: "learning", tags: l.about)
+            }
         }
         return fresh.count
     }

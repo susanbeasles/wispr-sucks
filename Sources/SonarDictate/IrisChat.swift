@@ -390,11 +390,13 @@ final class IrisChat: NSObject {
         guard let ledgers else { return }
         let scrubber = self.scrubber
         let deriver = self.deriver
+        let memory = self.memory, embedder = self.embedder
         Task.detached {
             guard let record = try? await Ingest.ingestEnriched(
                 SourceItem(source: source, provenance: provenance, at: Date(), text: text, externalId: nil),
                 scrub: scrubber, into: ledgers) else { return }
-            _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers)
+            _ = try? await Ingest.learn(from: record, using: deriver, into: ledgers,
+                                        recallInto: memory, embedder: embedder)
         }
     }
 
