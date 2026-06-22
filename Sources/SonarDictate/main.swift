@@ -1432,6 +1432,25 @@ if #available(macOS 26.0, *) {
         return try? Ledgers(dir: dir, enclave: enclave, recoverable: RecoverableWrap(kek: kek))
     }()
 
+    // Off-device backup (opt-in). If IRIS_BACKUP_DIR is set (e.g. an iCloud Drive
+    // or Dropbox local folder), replicate the RECOVERABLE chains there at launch
+    // and every 5 minutes. Zero-knowledge (ciphertext only); the company chain is
+    // never sent. No destination is chosen for you - unset = no backup.
+    if let backup = ProcessInfo.processInfo.environment["IRIS_BACKUP_DIR"], !backup.isEmpty,
+       let backupLedgers = irisLedgers {
+        let ledgerDir = SecureStore.baseDir.appendingPathComponent("ledger", isDirectory: true)
+        let sinkDir = URL(fileURLWithPath: (backup as NSString).expandingTildeInPath)
+        let runBackup = {
+            DispatchQueue.global(qos: .utility).async {
+                guard let sink = try? FolderSink(dir: sinkDir) else { return }
+                _ = try? Replicator.replicate(backupLedgers, dir: ledgerDir, to: sink)
+            }
+        }
+        runBackup()
+        let backupTimer = Timer(timeInterval: 300, repeats: true) { _ in runBackup() }
+        RunLoop.main.add(backupTimer, forMode: .common)
+    }
+
     let eyeOverlay = EyeOverlay()
     let eye = Eye()
     eye.attach(overlay: eyeOverlay)
