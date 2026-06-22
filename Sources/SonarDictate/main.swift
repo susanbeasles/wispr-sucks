@@ -117,13 +117,30 @@ final class Dictator {
 
     func bootstrap() {
         NSLog("SonarDictate: bootstrap() (engine=SpeechAnalyzer)")
-        // NOTE: tried engine.inputNode.setVoiceProcessingEnabled(true) for Apple
-        // Voice Isolation (music/noise suppression). It broke the capture pipeline -
-        // the changed input format corrupted the audio to the recognizer (constant
-        // degradation, empty finals, nothing saved or injected). Reverted. The
-        // one-call API does not drop cleanly into this engine/converter setup; if we
-        // revisit, it needs its own I/O configuration (and likely a connected output
-        // node for the echo-canceller), tested in isolation.
+        // VOICE ISOLATION (record over music/noise). Apple's voice-processing I/O
+        // (VPIO) runs hardware echo cancellation + noise suppression, so your voice
+        // is captured cleanly while music plays. The earlier attempt broke because
+        // VPIO is a DUPLEX unit: its echo-canceller needs the RENDER (output) side
+        // running, or capture is corrupted (empty finals). The fix is to drive a
+        // SILENT output so that render side runs.
+        //
+        // Enabled here in bootstrap (engine stopped, before any tap) so the changed
+        // input format is stable by the time startListening() reads it. Behind a
+        // flag while it gets real-world validation - I/O audio cannot be unit-tested:
+        //   IRIS_VOICE_ISOLATION=1
+        if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] == "1" {
+            do {
+                try engine.inputNode.setVoiceProcessingEnabled(true)
+                // Drive a silent render so the echo-canceller has its reference (the
+                // missing piece before). mainMixer -> output is the default graph;
+                // muting it means nothing is played, but the render chain still runs.
+                engine.mainMixerNode.outputVolume = 0
+                _ = engine.outputNode
+                NSLog("SonarDictate: voice isolation ON (dictate over music); input format now \(engine.inputNode.outputFormat(forBus: 0))")
+            } catch {
+                NSLog("SonarDictate: voice isolation enable failed: \(error.localizedDescription)")
+            }
+        }
 
         // Wire session callbacks. SpeechAnalyzer gives us a single
         // "current best transcript so far" string after each result;
