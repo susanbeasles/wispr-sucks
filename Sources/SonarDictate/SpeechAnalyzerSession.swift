@@ -92,12 +92,14 @@ final class SpeechAnalyzerSession {
     //
     // DEDUPED: trims, drops empties, and removes case-insensitive duplicates so a
     // phrase is never weighted more than once just for appearing twice.
-    func prepareVocabulary(_ rawTerms: [String]) async {
+    func prepareVocabulary(_ rawTerms: [(term: String, weight: Double)]) async {
         var seen = Set<String>()
-        let terms = rawTerms
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .filter { seen.insert($0.lowercased()).inserted }
+        var terms: [(term: String, weight: Double)] = []
+        for entry in rawTerms {
+            let t = entry.term.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty, seen.insert(t.lowercased()).inserted else { continue }
+            terms.append((t, entry.weight))
+        }
         guard !terms.isEmpty else { customModelConfig = nil; return }
 
         let dir = SecureStore.baseDir.appendingPathComponent("vocab", isDirectory: true)
@@ -108,16 +110,20 @@ final class SpeechAnalyzerSession {
             let data = SFCustomLanguageModelData(locale: locale,
                                                  identifier: "com.sonarmd.sonardictate.vocab",
                                                  version: "1")
-            // phraseBias = how hard the recognizer is pushed toward each jargon term.
-            // THE tuning knob. count:10 read as too weak and count:200 over-biased
-            // (normal "get" -> "git", everyday words pulled into jargon) - both were
-            // measured while the transcriber preset was misconfigured, which distorted
-            // how much bias was actually needed. With the preset restored, a MODERATE
-            // value favors the user's terms without steamrolling common words. Raise
-            // it if jargon is still mangled; lower it if normal words turn into jargon.
-            let phraseBias = 20
-            for term in terms {
-                SFCustomLanguageModelData.PhraseCount(phrase: term, count: phraseBias).insert(data: data)
+            // Per-term phrase bias, proportional to the dictionary weight. The old
+            // flat count:20 ignored the weights entirely, so a constantly-corrected
+            // term got the same nudge as a one-off and jargon kept losing to the
+            // general LM prior. Map weight -> count = base + weight*perWeight, clamped
+            // to [base, cap]; cap stays well under the level that over-biases common
+            // words ("get"->"git"). All three are env-tunable so the bias can be
+            // calibrated on-device (speak jargon, adjust, relaunch) without a rebuild.
+            let env = ProcessInfo.processInfo.environment
+            let base = Double(env["IRIS_VOCAB_BIAS_BASE"] ?? "") ?? 20
+            let perWeight = Double(env["IRIS_VOCAB_BIAS_PER_WEIGHT"] ?? "") ?? 6
+            let cap = Double(env["IRIS_VOCAB_BIAS_CAP"] ?? "") ?? 100
+            for (term, weight) in terms {
+                let count = Int(min(cap, max(base, base + weight * perWeight)).rounded())
+                SFCustomLanguageModelData.PhraseCount(phrase: term, count: count).insert(data: data)
             }
             try await data.export(to: assetURL)
             let config = SFSpeechLanguageModel.Configuration(languageModel: modelURL)
@@ -125,7 +131,7 @@ final class SpeechAnalyzerSession {
                                                                        configuration: config,
                                                                        ignoresCache: false)
             customModelConfig = config
-            NSLog("SonarDictate: custom vocabulary model ready (\(terms.count) terms)")
+            NSLog("SonarDictate: custom vocabulary model ready (\(terms.count) terms, weighted bias base=\(Int(base)) perWeight=\(Int(perWeight)) cap=\(Int(cap)))")
         } catch {
             customModelConfig = nil
             NSLog("SonarDictate: custom vocabulary model build failed: \(error.localizedDescription)")
@@ -214,7 +220,18 @@ final class SpeechAnalyzerSession {
         let negotiated = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         self.analyzerFormat = negotiated
         if let negotiated, negotiated != inputFormat {
-            self.converter = AVAudioConverter(from: inputFormat, to: negotiated)
+            let conv = AVAudioConverter(from: inputFormat, to: negotiated)
+            // When voice processing exposes a MULTICHANNEL input (mic + echo-
+            // reference channels that carry whatever is playing on this Mac), the
+            // default downmix averages the music reference back into the voice and
+            // the recognizer gets unintelligible audio (fed>0, peak high, results=0).
+            // Select channel 0 - the processed mic - instead of downmixing. The
+            // channelMap has one entry per OUTPUT channel; output is mono -> [0].
+            if inputFormat.channelCount > negotiated.channelCount {
+                conv?.channelMap = Array(repeating: 0, count: Int(negotiated.channelCount))
+                NSLog("SonarDictate: multichannel input (\(inputFormat.channelCount)ch) - selecting channel 0 (no downmix)")
+            }
+            self.converter = conv
             NSLog("SonarDictate: audio convert \(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> \(Int(negotiated.sampleRate))Hz/\(negotiated.channelCount)ch")
         } else {
             self.converter = nil

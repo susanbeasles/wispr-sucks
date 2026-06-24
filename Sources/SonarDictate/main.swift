@@ -63,6 +63,12 @@ final class Dictator {
     private let database: RecordingDatabase
     private let editWatcher: EditWatcher
     private var audioFrames: [AVAudioPCMBuffer] = []
+    // Speech gate (keeps non-speech out of the transcriber feed). Default shadow:
+    // evaluate + count, drop nothing, until validated that it never clips real
+    // speech. Set IRIS_VOICE_GATE=active to enforce, =off to disable.
+    private let voiceGateMode = VoiceGateMode(
+        rawValue: ProcessInfo.processInfo.environment["IRIS_VOICE_GATE"] ?? "shadow") ?? .shadow
+    private var voiceGate: VoiceGate?
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
@@ -143,8 +149,9 @@ final class Dictator {
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
                 let fmt = engine.inputNode.outputFormat(forBus: 0)
-                writeDiag("VOICE ISOLATION: ON\ninput format: \(fmt)\nsampleRate \(fmt.sampleRate) ch \(fmt.channelCount)\n")
-                NSLog("SonarDictate: voice isolation ON; format \(fmt)")
+                let micMode = AVCaptureDevice.activeMicrophoneMode.rawValue
+                writeDiag("VOICE ISOLATION: ON\ninput format: \(fmt)\nsampleRate \(fmt.sampleRate) ch \(fmt.channelCount)\nactiveMicMode \(micMode) (2=VoiceIsolation)\n")
+                NSLog("SonarDictate: voice isolation ON; format \(fmt); activeMicMode=\(micMode) (2=VoiceIsolation)")
             } catch {
                 writeDiag("VOICE ISOLATION: FAILED\nerror: \(error)\ndesc: \(error.localizedDescription)\n")
                 NSLog("SonarDictate: voice isolation enable FAILED: \(error)")
@@ -201,8 +208,11 @@ final class Dictator {
     // correction). Heavy + async, so it runs off the main path; the rebuilt model
     // takes effect on the next dictation once it finishes compiling.
     func refreshVocabularyModel() {
-        let terms = dictionary.terms(forContext: nil, limit: 500)
-        Task { await session.prepareVocabulary(terms) }
+        // Pass the weighted entries (not bare strings): the recognizer bias is now
+        // proportional to each term's dictionary weight, so the jargon the user
+        // corrects most gets pushed hardest. list() is strongest-weight-first.
+        let weighted = dictionary.list().prefix(500).map { (term: $0.term, weight: $0.weight) }
+        Task { await session.prepareVocabulary(Array(weighted)) }
     }
 
     private func installMonitor() {
@@ -433,6 +443,10 @@ final class Dictator {
 
         let format = engine.inputNode.outputFormat(forBus: 0)
         sessionFormat = format
+        // Fresh speech gate per session, at this session's sample rate.
+        let gate = VoiceGate(mode: voiceGateMode, sampleRate: format.sampleRate)
+        gate.reset()
+        voiceGate = gate
         // Remove any tap left over from a racy prior session before installing -
         // AVAudioEngine throws if a bus already has a tap.
         engine.inputNode.removeTap(onBus: 0)
@@ -445,7 +459,14 @@ final class Dictator {
             // raw mic-format audio for WAV storage.
             if let copy = self.copy(of: buffer) {
                 self.audioFrames.append(copy)
-                self.session.append(buffer: copy)
+                // The gate decides whether this buffer reaches the transcriber.
+                // In shadow/off it always forwards (counters still tally what
+                // active mode WOULD drop); in active it drops non-speech. The raw
+                // WAV (audioFrames) always keeps every buffer regardless.
+                let decision = gate.evaluate(copy)
+                if gate.shouldForward(decision) {
+                    self.session.append(buffer: copy)
+                }
             }
         }
 
@@ -492,6 +513,11 @@ final class Dictator {
         // the end" bug (volLen=0, final range ending ~180ms before release).
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
+        // Tap is gone now, so the gate counters are stable - log what it saw. In
+        // shadow mode wouldDrop is what active mode would have removed; if it is
+        // high on a session where the recognizer produced text, the gate is too
+        // aggressive and must not be flipped to active.
+        if let gate = voiceGate { NSLog("SonarDictate: \(gate.summary())") }
         session.stop()
         // The transcriber's results stream drains after end-of-input; its final
         // emission triggers finalize() via handleTranscript(isFinal: true).
