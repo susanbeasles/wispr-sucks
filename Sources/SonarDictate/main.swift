@@ -76,6 +76,14 @@ final class Dictator {
     // path is byte-identical unless enabled. See HarmonicVoiceIsolator.
     private let harmonicIsoEnabled = ProcessInfo.processInfo.environment["IRIS_HARMONIC_ISO"] == "1"
     private var isolator: StreamingHarmonicIsolator?
+    // Owner voiceprint gate (tier 2): when ON and enrolled, sustained non-owner audio
+    // is kept out of the transcriber feed. Opt-in via IRIS_VOICEPRINT=1; default OFF.
+    // The matcher runs off the audio thread (see VoiceprintGate); the seam only reads
+    // its atomic ownerPresent flag and defaults to forwarding (never clips the owner).
+    private let voiceprintEnabled = ProcessInfo.processInfo.environment["IRIS_VOICEPRINT"] == "1"
+    private var voiceEmbedder: VoiceEmbedder?
+    private var voiceTemplate: [Float]?
+    private var voiceprintGate: VoiceprintGate?
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
@@ -182,6 +190,27 @@ final class Dictator {
         // bias never stuck). Async (export + compile a beat after launch), reused
         // across sessions; rebuilt via refreshVocabularyModel() when words change.
         refreshVocabularyModel()
+
+        // Load the owner voiceprint once at launch (opt-in + enrolled): compiling the
+        // ECAPA model is heavy, so do it off the dictation path. The per-session gate
+        // (startListening) reuses this embedder + template.
+        if voiceprintEnabled {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                do {
+                    let vp = try VoiceprintStore()
+                    guard let tmpl = try vp.load() else {
+                        NSLog("SonarDictate: IRIS_VOICEPRINT set but not enrolled - run `sonar-dictate enroll`. Gate inactive.")
+                        return
+                    }
+                    let emb = try VoiceEmbedder()
+                    DispatchQueue.main.async { self.voiceEmbedder = emb; self.voiceTemplate = tmpl
+                        NSLog("SonarDictate: owner voiceprint loaded (threshold \(VoiceprintStore.threshold))") }
+                } catch {
+                    NSLog("SonarDictate: voiceprint load failed: \(error.localizedDescription)")
+                }
+            }
+        }
 
         // Rebuild the vocabulary model live when the edit-watcher learns a
         // correction, so the corrected word biases THIS session instead of only
@@ -464,6 +493,12 @@ final class Dictator {
         // Fresh isolator per session (opt-in). Streaming overlap-add keyed to the
         // pitch the gate already tracks.
         isolator = harmonicIsoEnabled ? StreamingHarmonicIsolator(sampleRate: Float(format.sampleRate)) : nil
+        // Fresh owner gate per session (opt-in + enrolled). Off the audio thread.
+        if voiceprintEnabled, let emb = voiceEmbedder, let tmpl = voiceTemplate {
+            voiceprintGate = VoiceprintGate(template: tmpl, embedder: emb, inputFormat: format)
+        } else {
+            voiceprintGate = nil
+        }
         // Remove any tap left over from a racy prior session before installing -
         // AVAudioEngine throws if a bus already has a tap.
         engine.inputNode.removeTap(onBus: 0)
@@ -476,12 +511,19 @@ final class Dictator {
             // raw mic-format audio for WAV storage.
             if let copy = self.copy(of: buffer) {
                 self.audioFrames.append(copy)
+                // Feed the owner gate (copy only; the match runs off-thread). Cheap.
+                if let vp = self.voiceprintGate, let ch = copy.floatChannelData {
+                    vp.ingest(UnsafeBufferPointer(start: ch[0], count: Int(copy.frameLength)))
+                }
                 // The gate decides whether this buffer reaches the transcriber.
                 // In shadow/off it always forwards (counters still tally what
                 // active mode WOULD drop); in active it drops non-speech. The raw
                 // WAV (audioFrames) always keeps every buffer regardless.
                 let decision = gate.evaluate(copy)
-                if gate.shouldForward(decision) {
+                // Owner gate: when enabled, sustained non-owner audio is held out of
+                // the transcriber feed. Defaults to present (never clips the owner).
+                let ownerOK = self.voiceprintGate?.ownerPresent ?? true
+                if gate.shouldForward(decision) && ownerOK {
                     if let iso = self.isolator,
                        let cleaned = self.isolateBuffer(copy, with: iso, pitch: decision.pitchHz) {
                         // Variable output length (STFT latency); empty while priming.

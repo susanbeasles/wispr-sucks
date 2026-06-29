@@ -35,6 +35,18 @@ mkdir -p "$MACOS_DIR"
 cp "$BIN_PATH" "$MACOS_DIR/SonarDictate"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
+# SwiftPM resource bundle (Bundle.module) - the voiceprint model + Fbank constants.
+# Bundle.module resolves a "<Package>_<Target>.bundle" next to the executable, so it
+# must sit beside the binary in Contents/MacOS or the app can't load the model
+# (the CLI in .build works because the bundle is already there).
+RES_BUNDLE="$ROOT/.build/$CONFIG/SonarDictate_SonarDictate.bundle"
+if [ -d "$RES_BUNDLE" ]; then
+  cp -R "$RES_BUNDLE" "$MACOS_DIR/"
+  echo "  bundled resources: $(basename "$RES_BUNDLE")"
+else
+  echo "! resource bundle not found ($RES_BUNDLE) - voiceprint model will be missing in the app"
+fi
+
 # Code signing - load-bearing for the dev loop.
 #
 # An UNSIGNED .app gets a fresh code hash on every rebuild, so macOS TCC
