@@ -1110,6 +1110,19 @@ final class Dictator {
 // MARK: - CLI dispatch
 
 func runCLI(_ args: [String]) -> Never {
+    // Offline DSP self-test for the native harmonic voice isolator. Handled BEFORE
+    // opening storage so it needs no Keychain/DB access (no permission prompts):
+    // pure synthetic-signal validation. Prints music suppression + voice retention.
+    if args.first == "isotest" {
+        if #available(macOS 14.0, *) {
+            let r = HarmonicVoiceIsolator.selfTest()
+            print(String(format: "harmonic isolator self-test (synthetic voice f0=140Hz + inharmonic music):"))
+            print(String(format: "  music suppression = %.1f dB  (higher = more music removed)", r.musicSuppressionDb))
+            print(String(format: "  voice retention   = %.1f dB  (closer to 0 = less voice lost)", r.voiceRetentionDb))
+        }
+        exit(0)
+    }
+
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex
@@ -1386,6 +1399,7 @@ func runCLI(_ args: [String]) -> Never {
             diagnostics:
               logs                          decrypt and print the diagnostic log
               logs --follow                 live-tail the decrypted log (Ctrl-C to stop)
+              isotest                       offline self-test of the native voice isolator (no mic/grant)
 
             (no args)  launch background dictation app
             """)
