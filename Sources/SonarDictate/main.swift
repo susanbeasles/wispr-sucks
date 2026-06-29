@@ -1351,6 +1351,29 @@ func runCLI(_ args: [String]) -> Never {
                 FileHandle.standardOutput.write(Data(text.utf8))
             }
 
+        case "aectest":
+            // Phase A validation: run the own-AEC capture + NLMS cancellation
+            // standalone (NOT wired to the recognizer) and print ERLE, so the
+            // cancellation can be validated on THIS hardware including a Bluetooth
+            // output device. Play music, talk over it, watch ERLE climb.
+            guard #available(macOS 14.2, *) else {
+                fputs("aec: requires macOS 14.2+\n", stderr)
+                exit(1)
+            }
+            let secs = Double(rest.first ?? "") ?? 8
+            let aec = AECEngine()
+            do {
+                try aec.start()
+            } catch {
+                fputs("aec: \(error)\n", stderr)
+                exit(1)
+            }
+            print("AEC running \(Int(secs))s - play music (try Bluetooth) and TALK over it.")
+            print("Watch ERLE (dB): higher = more music cancelled. Ctrl-C to stop early.")
+            Thread.sleep(forTimeInterval: secs)
+            aec.stop()
+            print("aec: done")
+
         case "help", "-h", "--help":
             print("""
             usage:  sonar-dictate <command> [args...]
@@ -1386,6 +1409,7 @@ func runCLI(_ args: [String]) -> Never {
             diagnostics:
               logs                          decrypt and print the diagnostic log
               logs --follow                 live-tail the decrypted log (Ctrl-C to stop)
+              aectest [seconds]             run the own-AEC canceller standalone, print ERLE (phase A)
 
             (no args)  launch background dictation app
             """)
