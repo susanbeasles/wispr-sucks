@@ -1218,6 +1218,49 @@ func runCLI(_ args: [String]) -> Never {
         }
     }
 
+    // Owner voiceprint enrollment (tier 2 P3). Before storage open: uses only the SE
+    // key + bundled model. Subcommands: (default) capture mic + enroll; status; reset;
+    // golden (enroll from the bundled fixture clip - no mic, for validation).
+    if args.first == "enroll" {
+        guard #available(macOS 14.0, *) else { fputs("enroll: requires macOS 14+\n", stderr); exit(1) }
+        let sub = args.count > 1 ? args[1] : "capture"
+        do {
+            let vp = try VoiceprintStore()
+            switch sub {
+            case "status":
+                print(vp.isEnrolled ? "voiceprint: ENROLLED (threshold \(VoiceprintStore.threshold))" : "voiceprint: not enrolled")
+            case "reset", "wipe":
+                try vp.reset()
+                print("voiceprint: reset (template wiped)")
+            case "golden":
+                struct G: Decodable { let audio: [Float] }
+                guard let u = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint") else {
+                    fputs("enroll: golden not bundled\n", stderr); exit(1)
+                }
+                let g = try JSONDecoder().decode(G.self, from: Data(contentsOf: u))
+                let emb = try VoiceEmbedder()
+                let tmpl = try VoiceEnroll.template(from: g.audio, embedder: emb)
+                try vp.save(tmpl)
+                let check = VoiceEmbedder.cosine(tmpl, try emb.embed(g.audio))
+                print(String(format: "voiceprint: enrolled from golden clip (dim %d, self-cosine %.4f)", tmpl.count, check))
+            default:
+                let secs = Double(sub) ?? 6
+                let emb = try VoiceEmbedder()
+                print("enroll: recording \(Int(secs))s - speak naturally now...")
+                let audio = try VoiceEnroll.captureMono16k(seconds: secs)
+                guard audio.count > Int(VoiceEnroll.targetRate) else {
+                    fputs("enroll: too little audio captured (\(audio.count) samples) - check mic permission\n", stderr); exit(1)
+                }
+                let tmpl = try VoiceEnroll.template(from: audio, embedder: emb)
+                try vp.save(tmpl)
+                print("voiceprint: enrolled (dim \(tmpl.count), \(audio.count) samples). Verify with: sonar-dictate enroll status")
+            }
+            exit(0)
+        } catch {
+            fputs("enroll: \(error)\n", stderr); exit(1)
+        }
+    }
+
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex
