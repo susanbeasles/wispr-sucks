@@ -76,6 +76,14 @@ final class Dictator {
     // path is byte-identical unless enabled. See HarmonicVoiceIsolator.
     private let harmonicIsoEnabled = ProcessInfo.processInfo.environment["IRIS_HARMONIC_ISO"] == "1"
     private var isolator: StreamingHarmonicIsolator?
+    // Owner voiceprint gate (tier 2): when ON and enrolled, sustained non-owner audio
+    // is kept out of the transcriber feed. Opt-in via IRIS_VOICEPRINT=1; default OFF.
+    // The matcher runs off the audio thread (see VoiceprintGate); the seam only reads
+    // its atomic ownerPresent flag and defaults to forwarding (never clips the owner).
+    private let voiceprintEnabled = ProcessInfo.processInfo.environment["IRIS_VOICEPRINT"] == "1"
+    private var voiceEmbedder: VoiceEmbedder?
+    private var voiceTemplate: [Float]?
+    private var voiceprintGate: VoiceprintGate?
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
@@ -182,6 +190,27 @@ final class Dictator {
         // bias never stuck). Async (export + compile a beat after launch), reused
         // across sessions; rebuilt via refreshVocabularyModel() when words change.
         refreshVocabularyModel()
+
+        // Load the owner voiceprint once at launch (opt-in + enrolled): compiling the
+        // ECAPA model is heavy, so do it off the dictation path. The per-session gate
+        // (startListening) reuses this embedder + template.
+        if voiceprintEnabled {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                do {
+                    let vp = try VoiceprintStore()
+                    guard let tmpl = try vp.load() else {
+                        NSLog("SonarDictate: IRIS_VOICEPRINT set but not enrolled - run `sonar-dictate enroll`. Gate inactive.")
+                        return
+                    }
+                    let emb = try VoiceEmbedder()
+                    DispatchQueue.main.async { self.voiceEmbedder = emb; self.voiceTemplate = tmpl
+                        NSLog("SonarDictate: owner voiceprint loaded (threshold \(VoiceprintStore.threshold))") }
+                } catch {
+                    NSLog("SonarDictate: voiceprint load failed: \(error.localizedDescription)")
+                }
+            }
+        }
 
         // Rebuild the vocabulary model live when the edit-watcher learns a
         // correction, so the corrected word biases THIS session instead of only
@@ -464,6 +493,12 @@ final class Dictator {
         // Fresh isolator per session (opt-in). Streaming overlap-add keyed to the
         // pitch the gate already tracks.
         isolator = harmonicIsoEnabled ? StreamingHarmonicIsolator(sampleRate: Float(format.sampleRate)) : nil
+        // Fresh owner gate per session (opt-in + enrolled). Off the audio thread.
+        if voiceprintEnabled, let emb = voiceEmbedder, let tmpl = voiceTemplate {
+            voiceprintGate = VoiceprintGate(template: tmpl, embedder: emb, inputFormat: format)
+        } else {
+            voiceprintGate = nil
+        }
         // Remove any tap left over from a racy prior session before installing -
         // AVAudioEngine throws if a bus already has a tap.
         engine.inputNode.removeTap(onBus: 0)
@@ -476,12 +511,19 @@ final class Dictator {
             // raw mic-format audio for WAV storage.
             if let copy = self.copy(of: buffer) {
                 self.audioFrames.append(copy)
+                // Feed the owner gate (copy only; the match runs off-thread). Cheap.
+                if let vp = self.voiceprintGate, let ch = copy.floatChannelData {
+                    vp.ingest(UnsafeBufferPointer(start: ch[0], count: Int(copy.frameLength)))
+                }
                 // The gate decides whether this buffer reaches the transcriber.
                 // In shadow/off it always forwards (counters still tally what
                 // active mode WOULD drop); in active it drops non-speech. The raw
                 // WAV (audioFrames) always keeps every buffer regardless.
                 let decision = gate.evaluate(copy)
-                if gate.shouldForward(decision) {
+                // Owner gate: when enabled, sustained non-owner audio is held out of
+                // the transcriber feed. Defaults to present (never clips the owner).
+                let ownerOK = self.voiceprintGate?.ownerPresent ?? true
+                if gate.shouldForward(decision) && ownerOK {
                     if let iso = self.isolator,
                        let cleaned = self.isolateBuffer(copy, with: iso, pitch: decision.pitchHz) {
                         // Variable output length (STFT latency); empty while priming.
@@ -1178,6 +1220,128 @@ func runCLI(_ args: [String]) -> Never {
             print("  (higher suppression = more music removed; retention near 0 = voice preserved)")
         }
         exit(0)
+    }
+
+    // Offline validation of the tier-2 voiceprint pipeline against the golden fixture
+    // (Swift Fbank == SpeechBrain feats, CoreML embedding == PyTorch proof). Before
+    // storage open: only reads the bundled model + golden, no Keychain/DB.
+    if args.first == "voicetest" {
+        guard #available(macOS 14.0, *) else { fputs("voicetest: requires macOS 14+\n", stderr); exit(1) }
+        struct Golden: Decodable { let audio: [Float]; let featsShape: [Int]; let feats: [Float]; let embedding: [Float] }
+        do {
+            guard let gURL = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint") else {
+                fputs("voicetest: golden.json not bundled\n", stderr); exit(1)
+            }
+            let g = try JSONDecoder().decode(Golden.self, from: Data(contentsOf: gURL))
+            let emb = try VoiceEmbedder()
+            let feats = emb.fbank(g.audio)
+            var maxAbs: Float = 0, sumAbs: Float = 0
+            let nn = min(feats.count, g.feats.count)
+            for i in 0..<nn { let d = abs(feats[i] - g.feats[i]); maxAbs = max(maxAbs, d); sumAbs += d }
+            let meanAbs = nn > 0 ? sumAbs / Float(nn) : 0
+            let v = try emb.embed(g.audio)
+            let cos = VoiceEmbedder.cosine(v, g.embedding)
+            // Diagnostic: feed the GOLDEN feats straight into the model to split a
+            // Swift-Fbank error from a CoreML input-layout error.
+            let vGolden = try emb.embedFeats(g.feats, frames: g.featsShape[0])
+            let cosGolden = VoiceEmbedder.cosine(vGolden, g.embedding)
+            print("voicetest (golden fixture):")
+            print("  Swift feats vs SpeechBrain: \(feats.count / 80)x80 (expected \(g.featsShape[0])x\(g.featsShape[1]))  maxAbs=\(String(format: "%.4g", maxAbs)) meanAbs=\(String(format: "%.4g", meanAbs))")
+            print(String(format: "  embedding from GOLDEN feats vs PyTorch: cosine = %.5f  (isolates CoreML io)", cosGolden))
+            print(String(format: "  Swift embedding vs PyTorch: cosine = %.5f", cos))
+            // The EMBEDDING is the validated quantity (speaker identity gates on it);
+            // a sub-dB per-bin feats diff (float32 DFT vs float64) is benign as long as
+            // the embedding agrees. Require both embedding paths > 0.999.
+            let pass = cos > 0.999 && cosGolden > 0.999
+            print("  VERDICT:", pass ? "PASS - on-device voiceprint matches the proof" : "FAIL - investigate")
+            exit(pass ? 0 : 1)
+        } catch {
+            fputs("voicetest: \(error)\n", stderr); exit(1)
+        }
+    }
+
+    // Owner voiceprint enrollment (tier 2 P3). Before storage open: uses only the SE
+    // key + bundled model. Subcommands: (default) capture mic + enroll; status; reset;
+    // golden (enroll from the bundled fixture clip - no mic, for validation).
+    if args.first == "enroll" {
+        guard #available(macOS 14.0, *) else { fputs("enroll: requires macOS 14+\n", stderr); exit(1) }
+        let sub = args.count > 1 ? args[1] : "capture"
+        do {
+            let vp = try VoiceprintStore()
+            switch sub {
+            case "status":
+                print(vp.isEnrolled ? "voiceprint: ENROLLED (threshold \(VoiceprintStore.threshold))" : "voiceprint: not enrolled")
+            case "reset", "wipe":
+                try vp.reset()
+                print("voiceprint: reset (template wiped)")
+            case "golden":
+                struct G: Decodable { let audio: [Float] }
+                guard let u = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint") else {
+                    fputs("enroll: golden not bundled\n", stderr); exit(1)
+                }
+                let g = try JSONDecoder().decode(G.self, from: Data(contentsOf: u))
+                let emb = try VoiceEmbedder()
+                let tmpl = try VoiceEnroll.template(from: g.audio, embedder: emb)
+                try vp.save(tmpl)
+                let check = VoiceEmbedder.cosine(tmpl, try emb.embed(g.audio))
+                print(String(format: "voiceprint: enrolled from golden clip (dim %d, self-cosine %.4f)", tmpl.count, check))
+            default:
+                let secs = Double(sub) ?? 6
+                let emb = try VoiceEmbedder()
+                print("enroll: recording \(Int(secs))s - speak naturally now...")
+                let audio = try VoiceEnroll.captureMono16k(seconds: secs)
+                guard audio.count > Int(VoiceEnroll.targetRate) else {
+                    fputs("enroll: too little audio captured (\(audio.count) samples) - check mic permission\n", stderr); exit(1)
+                }
+                let tmpl = try VoiceEnroll.template(from: audio, embedder: emb)
+                try vp.save(tmpl)
+                print("voiceprint: enrolled (dim \(tmpl.count), \(audio.count) samples). Verify with: sonar-dictate enroll status")
+            }
+            exit(0)
+        } catch {
+            fputs("enroll: \(error)\n", stderr); exit(1)
+        }
+    }
+
+    // Voice-unlock demo (tier 2): lock a secret, reveal it only on a voiceprint match.
+    if args.first == "lock" || args.first == "unlock" {
+        guard #available(macOS 14.0, *) else { fputs("requires macOS 14+\n", stderr); exit(1) }
+        do {
+            let vault = try VoiceVault()
+            if args.first == "lock" {
+                guard args.count > 1 else { fputs("usage: sonar-dictate lock \"<secret>\"\n", stderr); exit(2) }
+                try vault.lock(args[1])
+                print("locked: secret sealed. Reveal it with your voice: sonar-dictate unlock")
+                exit(0)
+            }
+            // unlock
+            let vp = try VoiceprintStore()
+            guard let tmpl = try vp.load() else {
+                fputs("unlock: not enrolled. Run `sonar-dictate enroll` first.\n", stderr); exit(1)
+            }
+            guard vault.hasSecret else { fputs("unlock: nothing locked. Run `sonar-dictate lock \"<secret>\"`.\n", stderr); exit(1) }
+            let emb = try VoiceEmbedder()
+            let audio: [Float]
+            if args.count > 1 && args[1] == "golden" {
+                struct G: Decodable { let audio: [Float] }
+                let u = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint")!
+                audio = try JSONDecoder().decode(G.self, from: Data(contentsOf: u)).audio
+            } else {
+                print("unlock: speak now (3s)...")
+                audio = try VoiceEnroll.captureMono16k(seconds: 3)
+            }
+            let (cos, ok) = try VoiceVault.match(audio, embedder: emb, template: tmpl)
+            if ok {
+                print(String(format: "UNLOCKED (voice match %.3f >= %.2f)", cos, VoiceprintStore.threshold))
+                print("secret: \(try vault.reveal())")
+                exit(0)
+            } else {
+                print(String(format: "DENIED (voice match %.3f < %.2f) - not the owner", cos, VoiceprintStore.threshold))
+                exit(1)
+            }
+        } catch {
+            fputs("\(args.first!): \(error)\n", stderr); exit(1)
+        }
     }
 
     let store: SecureStore

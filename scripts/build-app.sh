@@ -35,6 +35,23 @@ mkdir -p "$MACOS_DIR"
 cp "$BIN_PATH" "$MACOS_DIR/SonarDictate"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
+# SwiftPM resource bundle (Bundle.module) - the voiceprint model + Fbank constants.
+# It MUST go in Contents/Resources (not Contents/MacOS): Bundle.module resolves it via
+# Bundle.main.resourceURL, and codesign seals a resource bundle there cleanly. Placing
+# it in Contents/MacOS makes codesign reject it ("bundle format unrecognized") because
+# that is a code location - which silently leaves the whole app ad-hoc signed, so the
+# designated requirement becomes an unstable cdhash and the Accessibility grant never
+# sticks (AX-not-trusted -> dictation cannot inject).
+RES_BUNDLE="$ROOT/.build/$CONFIG/SonarDictate_SonarDictate.bundle"
+RESOURCES_DIR="$APP_DIR/Contents/Resources"
+if [ -d "$RES_BUNDLE" ]; then
+  mkdir -p "$RESOURCES_DIR"
+  cp -R "$RES_BUNDLE" "$RESOURCES_DIR/"
+  echo "  bundled resources: $(basename "$RES_BUNDLE") -> Contents/Resources"
+else
+  echo "! resource bundle not found ($RES_BUNDLE) - voiceprint model will be missing in the app"
+fi
+
 # Code signing - load-bearing for the dev loop.
 #
 # An UNSIGNED .app gets a fresh code hash on every rebuild, so macOS TCC
