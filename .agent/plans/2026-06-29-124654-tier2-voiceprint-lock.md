@@ -1,11 +1,22 @@
 ---
 name: tier2-voiceprint-lock
-status: in_progress
+status: code-complete-pending-on-device-validation
 blast_radius: medium
-owner_approved: yes (owner: "nice yeah" - proceed with tier 2 after tier 1 merged)
+owner_approved: yes (owner: "nice yeah" / "go" - proceed with tier 2 after tier 1 merged)
 design_ref: ~/code/voiceprint-build/README.md (ECAPA proof, 0.359 separation gap)
 builds_on: .agent/plans/2026-06-29-105844-native-voice-isolation.md (tier 1 merged, PR #1)
 ---
+
+## STATUS (branch feat/voiceprint-tier2)
+
+- P1 DONE (86f1d96): ECAPA -> CoreML, validated 1.0000 vs PyTorch, float32 IO.
+- P2 DONE (8722c9b): Swift Fbank+embedder, `voicetest` PASS (0.99999 vs proof).
+- P3 DONE (e1c4f57): `enroll` + EnclaveBox-sealed template; golden enroll self-cosine 1.0.
+- P4 DONE (3f480f1): VoiceprintGate at the seam, IRIS_VOICEPRINT default-off, RT-safe
+  (off-thread match, atomic flag, forward-by-default + hysteresis), build-app.sh
+  bundles the model.
+- REMAINING: owner on-device validation (mic + a second voice) to tune threshold /
+  hysteresis and confirm ZERO owner-word drop. THEN commit/push/PR/merge. No PR before.
 
 # Tier 2: lock voice isolation onto the OWNER via ECAPA voiceprint
 
