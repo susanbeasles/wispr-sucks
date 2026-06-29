@@ -145,10 +145,12 @@ with torch.no_grad():
     traced = torch.jit.trace(wrapped, example)
 
 time_dim = ct.RangeDim(lower_bound=16, upper_bound=4000, default=300)
+# Force float32 IO: the default fp16 IO mismatches a float32 MLMultiArray in Swift
+# (CoreML reinterprets the bytes -> garbage). Internal weights stay fp16.
 mlmodel = ct.convert(
     traced,
-    inputs=[ct.TensorType(name="feats", shape=(1, time_dim, 80))],
-    outputs=[ct.TensorType(name="embedding")],
+    inputs=[ct.TensorType(name="feats", shape=(1, time_dim, 80), dtype=np.float32)],
+    outputs=[ct.TensorType(name="embedding", dtype=np.float32)],
     minimum_deployment_target=ct.target.macOS14,
     compute_units=ct.ComputeUnit.ALL,
 )
@@ -215,7 +217,8 @@ from speechbrain.processing.features import Filterbank
 _fbm = Filterbank(n_mels=80, n_fft=400, sample_rate=16000, f_min=0, f_max=8000, log_mel=False)
 with torch.no_grad():
     mel_fb = _fbm(torch.eye(201).unsqueeze(0)).squeeze(0).detach().numpy()  # [201, 80]
-window = torch.hamming_window(400, periodic=False).numpy()
+# Pull the EXACT window SpeechBrain's STFT uses (do not guess periodic vs not).
+window = fbank.compute_STFT.window_fn(fbank.compute_STFT.win_length).numpy()
 consts = {
     "winLength": 400, "hopLength": 160, "nFft": 400, "nStft": 201, "nMels": 80,
     "sampleRate": 16000, "logMultiplier": 10.0, "amin": 1e-10, "topDb": 80.0,

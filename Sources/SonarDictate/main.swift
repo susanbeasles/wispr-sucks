@@ -1180,6 +1180,44 @@ func runCLI(_ args: [String]) -> Never {
         exit(0)
     }
 
+    // Offline validation of the tier-2 voiceprint pipeline against the golden fixture
+    // (Swift Fbank == SpeechBrain feats, CoreML embedding == PyTorch proof). Before
+    // storage open: only reads the bundled model + golden, no Keychain/DB.
+    if args.first == "voicetest" {
+        guard #available(macOS 14.0, *) else { fputs("voicetest: requires macOS 14+\n", stderr); exit(1) }
+        struct Golden: Decodable { let audio: [Float]; let featsShape: [Int]; let feats: [Float]; let embedding: [Float] }
+        do {
+            guard let gURL = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint") else {
+                fputs("voicetest: golden.json not bundled\n", stderr); exit(1)
+            }
+            let g = try JSONDecoder().decode(Golden.self, from: Data(contentsOf: gURL))
+            let emb = try VoiceEmbedder()
+            let feats = emb.fbank(g.audio)
+            var maxAbs: Float = 0, sumAbs: Float = 0
+            let nn = min(feats.count, g.feats.count)
+            for i in 0..<nn { let d = abs(feats[i] - g.feats[i]); maxAbs = max(maxAbs, d); sumAbs += d }
+            let meanAbs = nn > 0 ? sumAbs / Float(nn) : 0
+            let v = try emb.embed(g.audio)
+            let cos = VoiceEmbedder.cosine(v, g.embedding)
+            // Diagnostic: feed the GOLDEN feats straight into the model to split a
+            // Swift-Fbank error from a CoreML input-layout error.
+            let vGolden = try emb.embedFeats(g.feats, frames: g.featsShape[0])
+            let cosGolden = VoiceEmbedder.cosine(vGolden, g.embedding)
+            print("voicetest (golden fixture):")
+            print("  Swift feats vs SpeechBrain: \(feats.count / 80)x80 (expected \(g.featsShape[0])x\(g.featsShape[1]))  maxAbs=\(String(format: "%.4g", maxAbs)) meanAbs=\(String(format: "%.4g", meanAbs))")
+            print(String(format: "  embedding from GOLDEN feats vs PyTorch: cosine = %.5f  (isolates CoreML io)", cosGolden))
+            print(String(format: "  Swift embedding vs PyTorch: cosine = %.5f", cos))
+            // The EMBEDDING is the validated quantity (speaker identity gates on it);
+            // a sub-dB per-bin feats diff (float32 DFT vs float64) is benign as long as
+            // the embedding agrees. Require both embedding paths > 0.999.
+            let pass = cos > 0.999 && cosGolden > 0.999
+            print("  VERDICT:", pass ? "PASS - on-device voiceprint matches the proof" : "FAIL - investigate")
+            exit(pass ? 0 : 1)
+        } catch {
+            fputs("voicetest: \(error)\n", stderr); exit(1)
+        }
+    }
+
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex

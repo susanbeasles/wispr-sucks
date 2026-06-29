@@ -8,6 +8,13 @@ let package = Package(
         .executable(name: "sonar-dictate", targets: ["SonarDictate"]),
     ],
     targets: [
-        .executableTarget(name: "SonarDictate"),
+        .executableTarget(
+            name: "SonarDictate",
+            resources: [
+                // ECAPA voiceprint model + exact Fbank constants + golden fixture,
+                // loaded via Bundle.module (tier 2).
+                .copy("Resources/voiceprint"),
+            ]
+        ),
     ]
 )
