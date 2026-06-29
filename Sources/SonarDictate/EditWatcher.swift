@@ -53,6 +53,12 @@ final class EditWatcher {
     // write happen on the work item's main-queue execution.
     private let queue = DispatchQueue(label: "sonar-dictate.edit-watcher")
 
+    // Fired after a correction promotes one or more terms into the dictionary, so
+    // the running session can rebuild its vocabulary model live. Without this, a
+    // correction (e.g. "century" -> "Sentry") only biases the recognizer after the
+    // next app launch, so the same word keeps getting mis-recognized this session.
+    var onLearned: (() -> Void)?
+
     init(database: RecordingDatabase, dictionary: DictionaryStore, checkDelaySeconds: TimeInterval = 60) {
         self.database = database
         self.dictionary = dictionary
@@ -159,10 +165,13 @@ final class EditWatcher {
             // dump its whole vocabulary in. Count-only logging (terms may be PHI).
             let learned = Self.learnableTerms(original: original, corrected: current)
             for term in learned {
-                dictionary.add(term, weight: 3, source: .correction)
+                dictionary.learnCorrection(from: original, to: term)
             }
             if !learned.isEmpty {
                 NSLog("SonarDictate: edit-watcher learned \(learned.count) term(s) into the dictionary for \(id)")
+                // Rebuild the live vocabulary model so the correction biases THIS
+                // session, not just the next launch.
+                onLearned?()
             }
         } catch {
             NSLog("SonarDictate: edit-watcher write failed for \(id): \(error)")

@@ -57,6 +57,13 @@ fi
 if [ -n "$SIGN_IDENTITY" ]; then
   echo "> codesign: $SIGN_IDENTITY"
   codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP_DIR"
+  # Sign the standalone CLI binary too, with the SAME identifier + cert so it has
+  # the SAME designated requirement as the .app. The DB key in the Keychain is
+  # codesign-bound (see KeychainStore.swift); an UNSIGNED CLI binary has no stable
+  # requirement, so macOS re-prompts for the password on every keychain access and
+  # "Always Allow" never sticks (each rebuild changes the binary hash). Signing it
+  # with the stable identifier makes one "Always Allow" hold across rebuilds.
+  codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$BIN_PATH"
   codesign --verify --verbose=1 "$APP_DIR" && echo "  [ok] signature valid"
 else
   echo "! no Apple Development identity found - app left UNSIGNED."

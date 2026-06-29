@@ -106,11 +106,22 @@ final class DictionaryStore {
         return true
     }
 
-    // Learn from a correction: the user changed `wrong` -> `right`. The corrected
-    // term is a strong positive signal (the implicit thumbs-down made concrete),
-    // so it lands with high weight. Called by the edit-capture loop (phase 2).
+    // A correction is the STRONGEST signal we get: the user explicitly overruled
+    // the recognizer. A flat nudge holds no weight - a rare proper noun ("Sentry")
+    // loses to a word the general model prefers ("century") by a wide margin, so a
+    // small constant boost never closes the gap no matter how many times you fix it.
+    // One correction must therefore push the term far enough to INVERT the
+    // recognizer's preference: it drives the bias formula straight to its cap
+    // (base 20 + weight*6, cap 100 -> weight ~14 maxes it) in a single correction.
+    // Repeat corrections accumulate, keeping the term pinned at the top of the bias
+    // set. This is the strongest a single correction can push; if a word still
+    // loses at max bias, the formula cap (IRIS_VOCAB_BIAS_CAP) is the wall to lift.
+    private let correctionBoost: Double = 14
+
+    // Learn from a correction: the user changed `wrong` -> `right`. Called by the
+    // edit-capture loop (phase 2).
     func learnCorrection(from wrong: String, to right: String, appContext: String? = nil) {
-        add(right, weight: 3, appContext: appContext, source: .correction)
+        add(right, weight: correctionBoost, appContext: appContext, source: .correction)
     }
 
     // Top terms for the recognizer's contextual bias, scoped to the app when we

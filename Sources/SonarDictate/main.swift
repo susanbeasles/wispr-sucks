@@ -134,27 +134,27 @@ final class Dictator {
         // input format is stable by the time startListening() reads it. Behind a
         // flag while it gets real-world validation - I/O audio cannot be unit-tested:
         //   IRIS_VOICE_ISOLATION=1
-        // Voice isolation is ON by default now that it is validated (records cleanly
-        // over speaker music). Opt OUT with IRIS_VOICE_ISOLATION=0 if normal
-        // (no-music) dictation ever degrades. Enable failures degrade gracefully to
-        // plain capture (the do/catch below), so default-on is safe.
-        if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] != "0" {
-            // Write the result to a PLAINTEXT diag file (NSLog goes to the encrypted
-            // log, which is unreadable without the password-prompt flood). This lets
-            // the exact error be read directly.
-            let diag = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/SonarDictate-vpio.txt")
-            func writeDiag(_ s: String) { try? s.write(toFile: diag, atomically: true, encoding: .utf8) }
+        // Apple VPIO (voice-processing I/O) is OPT-IN, default OFF. Its black-box
+        // echo canceller ducks system music, breaks on Bluetooth, and degrades the
+        // common no-music case. That degraded audio makes the recognizer trust its
+        // generic acoustic guess over the user's personal vocabulary bias
+        // (e.g. "Sentry" -> "century"). Turn it on ONLY for the dictate-over-
+        // speaker-music case:
+        //   IRIS_VOICE_ISOLATION=1
+        // The durable fix (our own NLMS echo canceller: no ducking, works over
+        // Bluetooth) is parked in poc/aec - see
+        // .claude/plans/2026-06-24-053629-own-echo-canceller.md. Enable failures
+        // degrade gracefully to plain capture (the do/catch below).
+        if ProcessInfo.processInfo.environment["IRIS_VOICE_ISOLATION"] == "1" {
             engine.mainMixerNode.outputVolume = 0
             _ = engine.outputNode
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
                 let fmt = engine.inputNode.outputFormat(forBus: 0)
                 let micMode = AVCaptureDevice.activeMicrophoneMode.rawValue
-                writeDiag("VOICE ISOLATION: ON\ninput format: \(fmt)\nsampleRate \(fmt.sampleRate) ch \(fmt.channelCount)\nactiveMicMode \(micMode) (2=VoiceIsolation)\n")
                 NSLog("SonarDictate: voice isolation ON; format \(fmt); activeMicMode=\(micMode) (2=VoiceIsolation)")
             } catch {
-                writeDiag("VOICE ISOLATION: FAILED\nerror: \(error)\ndesc: \(error.localizedDescription)\n")
-                NSLog("SonarDictate: voice isolation enable FAILED: \(error)")
+                NSLog("SonarDictate: voice isolation enable FAILED: \(error) :: \(error.localizedDescription)")
             }
         }
 
@@ -175,6 +175,13 @@ final class Dictator {
         // bias never stuck). Async (export + compile a beat after launch), reused
         // across sessions; rebuilt via refreshVocabularyModel() when words change.
         refreshVocabularyModel()
+
+        // Rebuild the vocabulary model live when the edit-watcher learns a
+        // correction, so the corrected word biases THIS session instead of only
+        // after the next launch.
+        editWatcher.onLearned = { [weak self] in
+            DispatchQueue.main.async { self?.refreshVocabularyModel() }
+        }
 
         // Chip click -> copy its text to the clipboard (stashing the original so
         // we can restore it after the user's next paste).
