@@ -1303,6 +1303,47 @@ func runCLI(_ args: [String]) -> Never {
         }
     }
 
+    // Voice-unlock demo (tier 2): lock a secret, reveal it only on a voiceprint match.
+    if args.first == "lock" || args.first == "unlock" {
+        guard #available(macOS 14.0, *) else { fputs("requires macOS 14+\n", stderr); exit(1) }
+        do {
+            let vault = try VoiceVault()
+            if args.first == "lock" {
+                guard args.count > 1 else { fputs("usage: sonar-dictate lock \"<secret>\"\n", stderr); exit(2) }
+                try vault.lock(args[1])
+                print("locked: secret sealed. Reveal it with your voice: sonar-dictate unlock")
+                exit(0)
+            }
+            // unlock
+            let vp = try VoiceprintStore()
+            guard let tmpl = try vp.load() else {
+                fputs("unlock: not enrolled. Run `sonar-dictate enroll` first.\n", stderr); exit(1)
+            }
+            guard vault.hasSecret else { fputs("unlock: nothing locked. Run `sonar-dictate lock \"<secret>\"`.\n", stderr); exit(1) }
+            let emb = try VoiceEmbedder()
+            let audio: [Float]
+            if args.count > 1 && args[1] == "golden" {
+                struct G: Decodable { let audio: [Float] }
+                let u = Bundle.module.url(forResource: "golden", withExtension: "json", subdirectory: "voiceprint")!
+                audio = try JSONDecoder().decode(G.self, from: Data(contentsOf: u)).audio
+            } else {
+                print("unlock: speak now (3s)...")
+                audio = try VoiceEnroll.captureMono16k(seconds: 3)
+            }
+            let (cos, ok) = try VoiceVault.match(audio, embedder: emb, template: tmpl)
+            if ok {
+                print(String(format: "UNLOCKED (voice match %.3f >= %.2f)", cos, VoiceprintStore.threshold))
+                print("secret: \(try vault.reveal())")
+                exit(0)
+            } else {
+                print(String(format: "DENIED (voice match %.3f < %.2f) - not the owner", cos, VoiceprintStore.threshold))
+                exit(1)
+            }
+        } catch {
+            fputs("\(args.first!): \(error)\n", stderr); exit(1)
+        }
+    }
+
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex
