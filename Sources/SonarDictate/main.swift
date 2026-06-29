@@ -69,6 +69,13 @@ final class Dictator {
     private let voiceGateMode = VoiceGateMode(
         rawValue: ProcessInfo.processInfo.environment["IRIS_VOICE_GATE"] ?? "shadow") ?? .shadow
     private var voiceGate: VoiceGate?
+    // Native single-mic harmonic voice isolation (no system-audio grant): when ON,
+    // each forwarded buffer is cleaned (keep the speaker's harmonics, attenuate the
+    // inharmonic music/noise) before reaching the transcriber; the raw WAV stays
+    // complete. Opt-in via IRIS_HARMONIC_ISO=1; default OFF so the instant-capture
+    // path is byte-identical unless enabled. See HarmonicVoiceIsolator.
+    private let harmonicIsoEnabled = ProcessInfo.processInfo.environment["IRIS_HARMONIC_ISO"] == "1"
+    private var isolator: StreamingHarmonicIsolator?
     private var sessionStart: Date?
     private var sessionFormat: AVAudioFormat?
     private var sessionAppContext: String?
@@ -454,6 +461,9 @@ final class Dictator {
         let gate = VoiceGate(mode: voiceGateMode, sampleRate: format.sampleRate)
         gate.reset()
         voiceGate = gate
+        // Fresh isolator per session (opt-in). Streaming overlap-add keyed to the
+        // pitch the gate already tracks.
+        isolator = harmonicIsoEnabled ? StreamingHarmonicIsolator(sampleRate: Float(format.sampleRate)) : nil
         // Remove any tap left over from a racy prior session before installing -
         // AVAudioEngine throws if a bus already has a tap.
         engine.inputNode.removeTap(onBus: 0)
@@ -472,7 +482,13 @@ final class Dictator {
                 // WAV (audioFrames) always keeps every buffer regardless.
                 let decision = gate.evaluate(copy)
                 if gate.shouldForward(decision) {
-                    self.session.append(buffer: copy)
+                    if let iso = self.isolator,
+                       let cleaned = self.isolateBuffer(copy, with: iso, pitch: decision.pitchHz) {
+                        // Variable output length (STFT latency); empty while priming.
+                        if cleaned.frameLength > 0 { self.session.append(buffer: cleaned) }
+                    } else {
+                        self.session.append(buffer: copy)
+                    }
                 }
             }
         }
@@ -525,6 +541,16 @@ final class Dictator {
         // high on a session where the recognizer produced text, the gate is too
         // aggressive and must not be flipped to active.
         if let gate = voiceGate { NSLog("SonarDictate: \(gate.summary())") }
+        // Flush the isolator's held tail (STFT latency) into the recognizer BEFORE
+        // end-of-input, or the last ~one window of speech is clipped - same class of
+        // bug as the engine/tap/stop ordering above.
+        if let iso = isolator, let fmt = sessionFormat {
+            let tail = iso.flush()
+            if !tail.isEmpty, let buf = bufferFromSamples(tail, format: fmt) {
+                session.append(buffer: buf)
+            }
+            isolator = nil
+        }
         session.stop()
         // The transcriber's results stream drains after end-of-input; its final
         // emission triggers finalize() via handleTranscript(isFinal: true).
@@ -800,6 +826,35 @@ final class Dictator {
 
     // PCM buffer copy - the original buffer's storage is reused by the audio
     // engine, so we must clone the bytes to keep them.
+    // Run one mic buffer through the streaming harmonic isolator. Reads channel 0
+    // (the mic), feeds the gate's pitch estimate (0 = unvoiced -> clean passthrough),
+    // and wraps the emitted samples back into a buffer at the same format. Returns
+    // nil to fall back to the raw buffer.
+    private func isolateBuffer(_ buffer: AVAudioPCMBuffer, with iso: StreamingHarmonicIsolator, pitch: Float) -> AVAudioPCMBuffer? {
+        guard let ch = buffer.floatChannelData else { return nil }
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return nil }
+        let mono = Array(UnsafeBufferPointer(start: ch[0], count: n))
+        let cleaned = iso.process(mono, f0: pitch)
+        return bufferFromSamples(cleaned, format: buffer.format)
+    }
+
+    // Wrap mono Float samples into a buffer at `format` (cleaned voice copied to
+    // every channel). A zero-length buffer is valid (priming); callers skip append.
+    private func bufferFromSamples(_ samples: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let cap = AVAudioFrameCount(max(samples.count, 1))
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: cap),
+              let dst = buf.floatChannelData else { return nil }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        guard !samples.isEmpty else { return buf }
+        samples.withUnsafeBufferPointer { sp in
+            for ch in 0..<Int(format.channelCount) {
+                memcpy(dst[ch], sp.baseAddress!, samples.count * MemoryLayout<Float>.size)
+            }
+        }
+        return buf
+    }
+
     private func copy(of buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else {
             return nil
@@ -1110,6 +1165,21 @@ final class Dictator {
 // MARK: - CLI dispatch
 
 func runCLI(_ args: [String]) -> Never {
+    // Offline DSP self-test for the native harmonic voice isolator. Handled BEFORE
+    // opening storage so it needs no Keychain/DB access (no permission prompts):
+    // pure synthetic-signal validation. Prints music suppression + voice retention.
+    if args.first == "isotest" {
+        if #available(macOS 14.0, *) {
+            let b = HarmonicVoiceIsolator.selfTest()
+            let s = HarmonicVoiceIsolator.selfTestStreaming()
+            print("harmonic isolator self-test (synthetic voice f0=140Hz + inharmonic music):")
+            print(String(format: "  batch     music suppression = %5.1f dB   voice retention = %5.1f dB", b.musicSuppressionDb, b.voiceRetentionDb))
+            print(String(format: "  streaming music suppression = %5.1f dB   voice retention = %5.1f dB", s.musicSuppressionDb, s.voiceRetentionDb))
+            print("  (higher suppression = more music removed; retention near 0 = voice preserved)")
+        }
+        exit(0)
+    }
+
     let store: SecureStore
     let workflows: WorkflowStore
     let rag: RAGIndex
@@ -1386,6 +1456,7 @@ func runCLI(_ args: [String]) -> Never {
             diagnostics:
               logs                          decrypt and print the diagnostic log
               logs --follow                 live-tail the decrypted log (Ctrl-C to stop)
+              isotest                       offline self-test of the native voice isolator (no mic/grant)
 
             (no args)  launch background dictation app
             """)
