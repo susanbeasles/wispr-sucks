@@ -91,14 +91,12 @@ enum HarmonicVoiceIsolator {
 
     // MARK: - offline self-test (no audio device, no grant)
 
-    // Synthesize voice (harmonics of f0) and music (inharmonic tones + noise),
-    // measure how hard the isolator attenuates music-only vs how much voice-only it
-    // preserves. Returns (musicSuppressionDb, voiceRetentionDb).
-    static func selfTest(sampleRate: Float = 16000, f0: Float = 140) -> (musicSuppressionDb: Double, voiceRetentionDb: Double) {
+    // Synthesize voice (harmonics of f0) + inharmonic music (tones unrelated to f0
+    // plus broadband noise) for the self-tests.
+    static func synth(sampleRate: Float, f0: Float) -> (voice: [Float], music: [Float]) {
         let n = Int(sampleRate) * 3
         var seed: UInt64 = 0x9E3779B97F4A7C15
         func rnd() -> Float { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return Float(Int32(truncatingIfNeeded: seed)) / Float(Int32.max) }
-
         var voice = [Float](repeating: 0, count: n)
         var music = [Float](repeating: 0, count: n)
         for i in 0..<n {
@@ -107,25 +105,54 @@ enum HarmonicVoiceIsolator {
             var h = 1
             while h <= 20 { v += (1 / Float(h)) * sinf(2 * .pi * f0 * Float(h) * t); h += 1 }
             voice[i] = 0.3 * v
-            // inharmonic "music": tones unrelated to f0 + broadband noise
             music[i] = 0.4 * sinf(2 * .pi * 523 * t) + 0.3 * sinf(2 * .pi * 784 * t)
                      + 0.2 * sinf(2 * .pi * 1175 * t) + 0.15 * rnd()
         }
+        return (voice, music)
+    }
 
-        // Measure energy over the steady-state interior only: the first/last frame
-        // of an offline overlap-add has partial window coverage and is not
-        // representative (the live streaming path is continuous, with no such edge).
-        let lo = fftSize, hi = max(lo, n - fftSize)
-        func energy(_ a: [Float]) -> Double {
-            var s: Float = 0
-            a.withUnsafeBufferPointer { p in vDSP_svesq(p.baseAddress! + lo, 1, &s, vDSP_Length(hi - lo)) }
-            return Double(s)
-        }
+    // Energy over the steady-state interior only: the first/last frame of an
+    // overlap-add has partial window coverage and is not representative.
+    private static func interiorEnergy(_ a: [Float]) -> Double {
+        let lo = min(fftSize, a.count), hi = max(lo, a.count - fftSize)
+        guard hi > lo else { return 0 }
+        var s: Float = 0
+        a.withUnsafeBufferPointer { p in vDSP_svesq(p.baseAddress! + lo, 1, &s, vDSP_Length(hi - lo)) }
+        return Double(s)
+    }
 
+    // Batch core: attenuate music-only vs preserve voice-only. (suppressionDb, retentionDb)
+    static func selfTest(sampleRate: Float = 16000, f0: Float = 140) -> (musicSuppressionDb: Double, voiceRetentionDb: Double) {
+        let (voice, music) = synth(sampleRate: sampleRate, f0: f0)
         let yMusic = isolate(music, sampleRate: sampleRate, f0: f0)
         let yVoice = isolate(voice, sampleRate: sampleRate, f0: f0)
-        let supp = 10 * log10(energy(music) / max(energy(yMusic), 1e-12))
-        let ret = 10 * log10(max(energy(yVoice), 1e-12) / max(energy(voice), 1e-12))
+        let supp = 10 * log10(interiorEnergy(music) / max(interiorEnergy(yMusic), 1e-12))
+        let ret = 10 * log10(max(interiorEnergy(yVoice), 1e-12) / max(interiorEnergy(voice), 1e-12))
+        return (supp, ret)
+    }
+
+    // Streaming path: feed the same signals through StreamingHarmonicIsolator in
+    // odd-sized chunks (like live mic buffers) and confirm it matches the batch core.
+    @available(macOS 14.0, *)
+    static func selfTestStreaming(sampleRate: Float = 16000, f0: Float = 140) -> (musicSuppressionDb: Double, voiceRetentionDb: Double) {
+        let (voice, music) = synth(sampleRate: sampleRate, f0: f0)
+        func run(_ x: [Float]) -> [Float] {
+            guard let s = StreamingHarmonicIsolator(sampleRate: sampleRate) else { return x }
+            var y: [Float] = []
+            let sizes = [1024, 777, 2048, 333, 1500]
+            var i = 0, k = 0
+            while i < x.count {
+                let m = min(sizes[k % sizes.count], x.count - i)
+                y.append(contentsOf: s.process(Array(x[i..<i + m]), f0: f0))
+                i += m; k += 1
+            }
+            y.append(contentsOf: s.flush())
+            return y
+        }
+        let yMusic = run(music)
+        let yVoice = run(voice)
+        let supp = 10 * log10(interiorEnergy(music) / max(interiorEnergy(yMusic), 1e-12))
+        let ret = 10 * log10(max(interiorEnergy(yVoice), 1e-12) / max(interiorEnergy(voice), 1e-12))
         return (supp, ret)
     }
 }
