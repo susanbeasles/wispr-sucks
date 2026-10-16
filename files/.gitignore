@@ -1,0 +1,39 @@
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+.DS_Store
+dist/
+
+# Playwright MCP scratch artifacts (not project code)
+.playwright-mcp/
+
+# Iris voice: venv + downloaded model are heavy/local; the script is tracked
+voice/.venv/
+voice/*.onnx
+voice/*.bin
+voice/out.wav
+# Audition scratch: rendered samples + the candidate log are local artifacts.
+# Her CHOSEN voice (voice/iris_voice.json) IS tracked - it is her identity.
+voice/__pycache__/
+voice/audition_*.wav
+voice/audition_options.json
+
+
+.guard/logs/
+
+
+.agent-guard/policy.local.json
+
+
+.agent-guard/UNLOCK-*
+
+
+.agent-guard/__pycache__/
+
+
+.guard/hooks/__pycache__/
+
+
+.claude/settings.local.json
